@@ -1,4 +1,5 @@
 .env
+generated/
 node_modules/
 *.log
 .seedream-server.json

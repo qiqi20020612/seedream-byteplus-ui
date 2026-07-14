@@ -1,4 +1,3 @@
-const MODEL_ID = "dola-seedream-5-0-pro-260628";
 const STORAGE_KEY = "seedream.byteplus.apiKey";
 const MAX_REFERENCES = 10;
 const MAX_REFERENCE_BYTES = 30 * 1024 * 1024;
@@ -11,11 +10,14 @@ const regionBaseUrls = {
 const state = {
   mode: "text",
   references: [],
-  lastPayload: null
+  lastPayload: null,
+  modelId: "",
+  generations: new Map()
 };
 
 const els = {
   form: document.querySelector("#generatorForm"),
+  modelName: document.querySelector("#modelName"),
   serverStatus: document.querySelector("#serverStatus"),
   prompt: document.querySelector("#prompt"),
   promptCount: document.querySelector("#promptCount"),
@@ -144,10 +146,14 @@ async function checkServer() {
   try {
     const response = await fetch("/api/health");
     const data = await response.json();
+    state.modelId = String(data.model || "").trim();
+    els.modelName.textContent = state.modelId || "未配置模型";
     els.serverStatus.textContent = data.hasEnvKey ? "已配置密钥" : "等待密钥";
     els.serverStatus.classList.toggle("is-ready", data.hasEnvKey);
     els.serverStatus.classList.toggle("is-warn", !data.hasEnvKey);
+    updateRequestPreview();
   } catch {
+    els.modelName.textContent = "模型加载失败";
     els.serverStatus.textContent = "连接失败";
     els.serverStatus.classList.add("is-warn");
   }
@@ -318,7 +324,7 @@ function buildPayload({ preview = false } = {}) {
     region: els.region.value,
     baseUrl: els.region.value === "custom" ? els.baseUrl.value.trim() : undefined,
     mode: state.mode,
-    model: MODEL_ID,
+    model: state.modelId || undefined,
     prompt,
     size,
     output_format: els.outputFormat.value,
@@ -374,14 +380,15 @@ async function handleSubmit(event) {
     return;
   }
 
-  setBusy(true);
+  const task = createGenerationTask(payload);
   state.lastPayload = payload;
 
   try {
     const response = await fetch("/api/generate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: task.controller.signal
     });
 
     const data = await response.json().catch(() => ({}));
@@ -389,91 +396,114 @@ async function handleSubmit(event) {
       throw new Error(extractError(data, response.status));
     }
 
-    renderResult(data);
+    renderResult(data, task);
   } catch (error) {
-    showNotice(error.message, "error");
+    if (error.name === "AbortError") {
+      showNotice("已取消生成。", "info");
+    } else {
+      showNotice(error.message, "error");
+    }
   } finally {
-    setBusy(false);
+    removeGenerationTask(task.id);
   }
 }
 
-function renderResult(result) {
+function renderResult(result, task) {
   const provider = result.provider || {};
   const images = Array.isArray(provider.data) ? provider.data : [];
+  const saved = Array.isArray(result.saved) ? result.saved : [];
+  const saveErrors = Array.isArray(result.saveErrors) ? result.saveErrors : [];
+  const savedByIndex = new Map(saved.map((item) => [item.index, item]));
   els.rawResponse.textContent = JSON.stringify(result, null, 2);
-  els.resultGrid.innerHTML = "";
-  els.resultGrid.classList.toggle("is-empty", images.length === 0);
-  els.resultMeta.textContent = images.length ? `${images.length} 张图片` : "没有返回图片";
 
-  if (images.length === 0) return;
+  if (saveErrors.length > 0) {
+    showNotice(`生成成功，但有 ${saveErrors.length} 张图片未能自动保存。保存目录：${result.outputDir}`, "error");
+  } else if (saved.length > 0) {
+    showNotice(`已自动保存到 ${result.outputDir}`);
+  }
 
+  const fragment = document.createDocumentFragment();
   images.forEach((item, index) => {
-    const source = normalizeImageSource(item);
-    const card = document.createElement("article");
-    card.className = "result-card";
-
-    const image = document.createElement("img");
-    image.src = source.src;
-    image.alt = `Seedream result ${index + 1}`;
-    card.append(image);
-
-    const body = document.createElement("div");
-    body.className = "result-card-body";
-
-    const meta = document.createElement("code");
-    meta.textContent = source.label;
-    body.append(meta);
-
-    const actions = document.createElement("div");
-    actions.className = "result-actions";
-
-    if (source.src) {
-      const open = document.createElement("a");
-      open.href = source.src;
-      open.target = "_blank";
-      open.rel = "noreferrer";
-      open.innerHTML = `${icons.external}打开`;
-      actions.append(open);
-    }
-
-    if (source.copyValue) {
-      const copy = document.createElement("button");
-      copy.type = "button";
-      copy.innerHTML = `${icons.copy}复制`;
-      copy.addEventListener("click", () => copyText(source.copyValue));
-      actions.append(copy);
-    }
-
-    if (source.downloadValue) {
-      const download = document.createElement("a");
-      download.href = source.downloadValue;
-      download.download = `seedream-${Date.now()}-${index + 1}.${els.outputFormat.value}`;
-      download.innerHTML = `${icons.download}保存`;
-      actions.append(download);
-    }
-
-    body.append(actions);
-    card.append(body);
-    els.resultGrid.append(card);
+    fragment.append(createResultCard(item, savedByIndex.get(index), index, task.outputFormat));
   });
+
+  if (task.card.isConnected) {
+    els.resultGrid.insertBefore(fragment, task.card);
+  } else {
+    els.resultGrid.prepend(fragment);
+  }
+
+  removeGenerationTask(task.id);
 }
 
-function normalizeImageSource(item) {
+function createResultCard(item, saved, index, outputFormat) {
+  const source = normalizeImageSource(item, saved, outputFormat);
+  const card = document.createElement("article");
+  card.className = "result-card";
+
+  const image = document.createElement("img");
+  image.src = source.src;
+  image.alt = `Seedream result ${index + 1}`;
+  card.append(image);
+
+  const body = document.createElement("div");
+  body.className = "result-card-body";
+
+  const meta = document.createElement("code");
+  meta.textContent = source.label;
+  body.append(meta);
+
+  const actions = document.createElement("div");
+  actions.className = "result-actions";
+
+  if (source.src) {
+    const open = document.createElement("a");
+    open.href = source.src;
+    open.target = "_blank";
+    open.rel = "noreferrer";
+    open.innerHTML = `${icons.external}打开`;
+    actions.append(open);
+  }
+
+  if (source.copyValue) {
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.innerHTML = `${icons.copy}复制`;
+    copy.addEventListener("click", () => copyText(source.copyValue));
+    actions.append(copy);
+  }
+
+  if (source.downloadValue) {
+    const download = document.createElement("a");
+    download.href = source.downloadValue;
+    download.download = source.downloadName || `seedream-${Date.now()}-${index + 1}.${outputFormat}`;
+    download.innerHTML = `${icons.download}保存`;
+    actions.append(download);
+  }
+
+  body.append(actions);
+  card.append(body);
+  return card;
+}
+
+function normalizeImageSource(item, saved, outputFormat) {
   if (item.url) {
     return {
-      src: item.url,
-      label: item.size || "url",
+      src: saved ? saved.url : item.url,
+      label: saved ? `已保存 · ${saved.fileName}` : (item.size || "url"),
       copyValue: item.url
     };
   }
 
   if (item.b64_json) {
-    const src = `data:image/${els.outputFormat.value};base64,${item.b64_json}`;
+    const fallbackSrc = `data:image/${outputFormat};base64,${item.b64_json}`;
+    const src = saved ? saved.url : fallbackSrc;
     return {
       src,
-      label: item.size || "b64_json",
+      label: saved ? `已保存 · ${saved.fileName}` : (item.size || "b64_json"),
       copyValue: "",
-      downloadValue: src
+      downloadValue: src,
+      downloadName: saved ? saved.fileName : ""
     };
   }
 
@@ -490,11 +520,111 @@ function extractError(data, status) {
   return `请求失败：${status}`;
 }
 
-function setBusy(busy) {
-  els.generateButton.disabled = busy;
-  els.generateButton.innerHTML = busy
-    ? `${icons.spark}生成中`
+function createGenerationTask(payload) {
+  const id = crypto.randomUUID();
+  const controller = new AbortController();
+  const card = document.createElement("article");
+  card.className = "result-card generation-card";
+  card.dataset.generationId = id;
+  card.setAttribute("role", "status");
+  card.setAttribute("aria-live", "polite");
+
+  const visual = document.createElement("div");
+  visual.className = "generation-card-visual";
+
+  const status = document.createElement("div");
+  status.className = "generation-card-status";
+  status.innerHTML = `<span class="generation-card-spark">${icons.spark}</span><strong>正在生成</strong>`;
+  visual.append(status);
+  card.append(visual);
+
+  const body = document.createElement("div");
+  body.className = "result-card-body generation-card-body";
+
+  const prompt = document.createElement("p");
+  prompt.textContent = payload.prompt;
+  body.append(prompt);
+
+  const footer = document.createElement("div");
+  footer.className = "generation-card-footer";
+
+  const time = document.createElement("code");
+  time.textContent = "已等待 0 秒";
+  footer.append(time);
+
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "generation-cancel";
+  cancel.innerHTML = `${icons.close}取消`;
+  cancel.addEventListener("click", () => cancelGeneration(id));
+  footer.append(cancel);
+  body.append(footer);
+  card.append(body);
+
+  const task = {
+    id,
+    controller,
+    card,
+    statusNode: status.querySelector("strong"),
+    timeNode: time,
+    cancelButton: cancel,
+    outputFormat: payload.output_format,
+    startedAt: Date.now(),
+    timer: null
+  };
+  task.timer = setInterval(() => updateGenerationTaskTime(task), 1000);
+  state.generations.set(id, task);
+  els.resultGrid.prepend(card);
+  updateGenerateButton();
+  updateResultMeta();
+  return task;
+}
+
+function updateGenerationTaskTime(task) {
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - task.startedAt) / 1000));
+  task.timeNode.textContent = `已等待 ${elapsedSeconds} 秒`;
+}
+
+function cancelGeneration(id) {
+  const task = state.generations.get(id);
+  if (!task || task.controller.signal.aborted) return;
+
+  task.statusNode.textContent = "正在取消";
+  task.card.classList.add("is-cancelling");
+  task.cancelButton.disabled = true;
+  task.controller.abort();
+}
+
+function removeGenerationTask(id) {
+  const task = state.generations.get(id);
+  if (!task) return;
+
+  clearInterval(task.timer);
+  task.card.remove();
+  state.generations.delete(id);
+  updateGenerateButton();
+  updateResultMeta();
+}
+
+function updateGenerateButton() {
+  const activeCount = state.generations.size;
+  els.generateButton.disabled = false;
+  els.generateButton.innerHTML = activeCount > 0
+    ? `${icons.spark}继续生成（${activeCount} 个进行中）`
     : `${icons.spark}生成`;
+}
+
+function updateResultMeta() {
+  const imageCount = els.resultGrid.querySelectorAll(".result-card:not(.generation-card)").length;
+  const generationCount = state.generations.size;
+  els.resultGrid.classList.toggle("is-empty", imageCount === 0 && generationCount === 0);
+
+  if (generationCount > 0) {
+    const resultSummary = imageCount > 0 ? ` · 已有 ${imageCount} 张图片` : "";
+    els.resultMeta.textContent = `${generationCount} 个任务生成中${resultSummary}`;
+  } else {
+    els.resultMeta.textContent = imageCount > 0 ? `${imageCount} 张图片` : "等待生成";
+  }
 }
 
 function showNotice(message, type = "info") {
@@ -510,9 +640,12 @@ function hideNotice() {
 }
 
 function clearResults() {
+  const generationCards = [...els.resultGrid.querySelectorAll(".generation-card")];
   els.resultGrid.innerHTML = "";
-  els.resultGrid.classList.add("is-empty");
-  els.resultMeta.textContent = "等待生成";
+  for (const card of generationCards) {
+    els.resultGrid.append(card);
+  }
+  updateResultMeta();
   els.rawResponse.textContent = "";
   hideNotice();
 }

@@ -1,15 +1,22 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
+const { randomUUID } = require("node:crypto");
 const { URL } = require("node:url");
 
 loadEnvFile();
 
 const PUBLIC_DIR = path.join(__dirname, "public");
 const STATUS_FILE = path.join(__dirname, ".seedream-server.json");
-const MODEL_ID = "dola-seedream-5-0-pro-260628";
+const OUTPUT_DIR = path.resolve(__dirname, process.env.OUTPUT_DIR || "generated");
+const DEFAULT_MODEL_ID = "dola-seedream-5-0-pro-260628";
+const MODEL_ID = String(process.env.ARK_MODEL_ID || DEFAULT_MODEL_ID).trim() || DEFAULT_MODEL_ID;
 const DEFAULT_PORT = Number.parseInt(process.env.PORT || "8787", 10);
 const MAX_BODY_BYTES = Number.parseInt(process.env.MAX_BODY_BYTES || String(90 * 1024 * 1024), 10);
+const MAX_SAVED_IMAGE_BYTES = Number.parseInt(
+  process.env.MAX_SAVED_IMAGE_BYTES || String(50 * 1024 * 1024),
+  10
+);
 const REQUEST_TIMEOUT_MS = Number.parseInt(process.env.REQUEST_TIMEOUT_MS || "180000", 10);
 
 const REGION_BASE_URLS = {
@@ -46,6 +53,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         model: MODEL_ID,
         hasEnvKey: Boolean(getEnvApiKey()),
+        outputDir: OUTPUT_DIR,
         defaultBaseUrl: process.env.ARK_BASE_URL || REGION_BASE_URLS["ap-southeast-1"],
         regions: REGION_BASE_URLS
       });
@@ -53,16 +61,43 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && requestUrl.pathname === "/api/generate") {
-      const input = await readJsonBody(req);
-      const { apiKey, endpoint, providerBody, safeRequest } = buildProviderRequest(input);
-      const provider = await callBytePlus(endpoint, apiKey, providerBody);
-      sendJson(res, 200, {
-        ok: true,
-        model: MODEL_ID,
-        endpoint,
-        request: safeRequest,
-        provider
-      });
+      const generationController = new AbortController();
+      const cancelOnDisconnect = () => {
+        if (!res.writableEnded) generationController.abort();
+      };
+      if (typeof res.once === "function") {
+        res.once("close", cancelOnDisconnect);
+      }
+
+      try {
+        const input = await readJsonBody(req);
+        const { apiKey, endpoint, providerBody, safeRequest } = buildProviderRequest(input);
+        const provider = await callBytePlus(endpoint, apiKey, providerBody, generationController.signal);
+        const savedResult = await saveGeneratedImages(
+          provider,
+          providerBody.output_format,
+          generationController.signal
+        );
+        sendJson(res, 200, {
+          ok: true,
+          model: MODEL_ID,
+          endpoint,
+          request: safeRequest,
+          saved: savedResult.files,
+          saveErrors: savedResult.errors,
+          outputDir: OUTPUT_DIR,
+          provider
+        });
+      } finally {
+        if (typeof res.off === "function") {
+          res.off("close", cancelOnDisconnect);
+        }
+      }
+      return;
+    }
+
+    if (req.method === "GET" && requestUrl.pathname.startsWith("/generated/")) {
+      serveGenerated(requestUrl.pathname, res);
       return;
     }
 
@@ -73,6 +108,7 @@ const server = http.createServer(async (req, res) => {
 
     sendJson(res, 405, { ok: false, error: "Method not allowed." });
   } catch (error) {
+    if (res.destroyed || res.writableEnded) return;
     const status = error.statusCode || error.status || 500;
     sendJson(res, status, {
       ok: false,
@@ -174,6 +210,33 @@ function serveStatic(pathname, res) {
       }
 
       sendJson(res, 500, { ok: false, error: "Static file error." });
+      return;
+    }
+
+    const ext = path.extname(filePath).toLowerCase();
+    res.writeHead(200, {
+      "Content-Type": MIME_TYPES[ext] || "application/octet-stream",
+      "Cache-Control": "no-store"
+    });
+    res.end(content);
+  });
+}
+
+function serveGenerated(pathname, res) {
+  const relativePath = decodeURIComponent(pathname.slice("/generated/".length));
+  const filePath = path.resolve(OUTPUT_DIR, relativePath);
+  const outputPrefix = `${OUTPUT_DIR}${path.sep}`;
+
+  if (!filePath.startsWith(outputPrefix)) {
+    sendJson(res, 403, { ok: false, error: "Forbidden." });
+    return;
+  }
+
+  fs.readFile(filePath, (error, content) => {
+    if (error) {
+      const status = error.code === "ENOENT" ? 404 : 500;
+      const message = status === 404 ? "Saved image not found." : "Saved image read error.";
+      sendJson(res, status, { ok: false, error: message });
       return;
     }
 
@@ -352,9 +415,136 @@ function summarizeImagesForLog(image) {
   return Array.isArray(image) ? summarized : summarized[0];
 }
 
-async function callBytePlus(endpoint, apiKey, body) {
+async function saveGeneratedImages(provider, outputFormat, signal) {
+  const images = Array.isArray(provider && provider.data) ? provider.data : [];
+  if (images.length === 0) {
+    return { files: [], errors: [] };
+  }
+
+  throwIfGenerationCancelled(signal);
+
+  try {
+    await fs.promises.mkdir(OUTPUT_DIR, { recursive: true });
+  } catch (error) {
+    return {
+      files: [],
+      errors: images.map((_, index) => ({
+        index,
+        error: error.message || "Unable to create the output directory."
+      }))
+    };
+  }
+  const outcomes = await Promise.all(
+    images.map((item, index) => saveGeneratedImage(item, index, outputFormat, signal))
+  );
+  throwIfGenerationCancelled(signal);
+
+  return outcomes.reduce(
+    (result, outcome) => {
+      if (outcome.error) {
+        result.errors.push(outcome);
+      } else {
+        result.files.push(outcome);
+      }
+      return result;
+    },
+    { files: [], errors: [] }
+  );
+}
+
+async function saveGeneratedImage(item, index, outputFormat, signal) {
+  try {
+    throwIfGenerationCancelled(signal);
+    let content;
+    let source;
+
+    if (item && item.b64_json) {
+      const encoded = String(item.b64_json).replace(/^data:[^;]+;base64,/i, "");
+      content = Buffer.from(encoded, "base64");
+      source = "b64_json";
+    } else if (item && item.url) {
+      content = await downloadGeneratedImage(item.url, signal);
+      source = "url";
+    } else {
+      throw new Error("The provider result does not contain an image URL or b64_json.");
+    }
+
+    if (content.length === 0) {
+      throw new Error("The generated image is empty.");
+    }
+    if (content.length > MAX_SAVED_IMAGE_BYTES) {
+      throw new Error(`The generated image exceeds ${MAX_SAVED_IMAGE_BYTES} bytes.`);
+    }
+
+    const extension = normalizeImageExtension(outputFormat);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const fileName = `seedream-${timestamp}-${index + 1}-${randomUUID().slice(0, 8)}.${extension}`;
+    const filePath = path.join(OUTPUT_DIR, fileName);
+    await fs.promises.writeFile(filePath, content, { flag: "wx", signal });
+
+    return {
+      index,
+      fileName,
+      url: `/generated/${encodeURIComponent(fileName)}`,
+      bytes: content.length,
+      source
+    };
+  } catch (error) {
+    return {
+      index,
+      error: error.message || "Unable to save generated image."
+    };
+  }
+}
+
+async function downloadGeneratedImage(imageUrl, externalSignal) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const signal = externalSignal
+    ? AbortSignal.any([controller.signal, externalSignal])
+    : controller.signal;
+
+  try {
+    const response = await fetch(imageUrl, { signal });
+    if (!response.ok) {
+      throw new Error(`Image download failed with status ${response.status}.`);
+    }
+
+    const declaredLength = Number.parseInt(response.headers.get("content-length") || "0", 10);
+    if (declaredLength > MAX_SAVED_IMAGE_BYTES) {
+      throw new Error(`The generated image exceeds ${MAX_SAVED_IMAGE_BYTES} bytes.`);
+    }
+
+    return Buffer.from(await response.arrayBuffer());
+  } catch (error) {
+    if (error.name === "AbortError") {
+      if (externalSignal && externalSignal.aborted) {
+        throw makeHttpError(499, "Generation cancelled.");
+      }
+      throw new Error("Image download timed out.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function normalizeImageExtension(outputFormat) {
+  return String(outputFormat || "png").toLowerCase() === "jpeg" ? "jpeg" : "png";
+}
+
+function throwIfGenerationCancelled(signal) {
+  if (signal && signal.aborted) {
+    throw makeHttpError(499, "Generation cancelled.");
+  }
+}
+
+async function callBytePlus(endpoint, apiKey, body, externalSignal) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const signal = externalSignal
+    ? AbortSignal.any([controller.signal, externalSignal])
+    : controller.signal;
 
   try {
     const response = await fetch(endpoint, {
@@ -364,7 +554,7 @@ async function callBytePlus(endpoint, apiKey, body) {
         Authorization: `Bearer ${apiKey}`
       },
       body: JSON.stringify(body),
-      signal: controller.signal
+      signal
     });
 
     const contentType = response.headers.get("content-type") || "";
@@ -380,6 +570,9 @@ async function callBytePlus(endpoint, apiKey, body) {
     return payload;
   } catch (error) {
     if (error.name === "AbortError") {
+      if (externalSignal && externalSignal.aborted) {
+        throw makeHttpError(499, "Generation cancelled.");
+      }
       throw makeHttpError(504, "BytePlus request timed out.");
     }
 
