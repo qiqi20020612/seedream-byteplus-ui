@@ -7,6 +7,30 @@ const regionBaseUrls = {
   "eu-west-1": "https://ark.eu-west.bytepluses.com/api/v3"
 };
 
+const documentedSizePresets = {
+  "1K": {
+    "1:1": "1024x1024",
+    "4:3": "1152x864",
+    "3:4": "864x1152",
+    "16:9": "1424x800",
+    "9:16": "800x1424",
+    "3:2": "1248x832",
+    "2:3": "832x1248",
+    "21:9": "1568x672"
+  },
+  "2K": {
+    "1:1": "2048x2048",
+    "4:3": "2368x1776",
+    "3:4": "1776x2368",
+    "16:9": "2816x1584",
+    "9:16": "1584x2816",
+    "3:2": "2496x1664",
+    "2:3": "1664x2496",
+    "21:9": "3136x1344"
+  }
+};
+const supportedAspectRatios = Object.keys(documentedSizePresets["2K"]);
+
 const state = {
   mode: "text",
   references: [],
@@ -199,6 +223,7 @@ function persistKey() {
 
 async function handleFileInput(event) {
   const files = [...event.target.files];
+  let latestReference = null;
   for (const file of files) {
     if (state.references.length >= MAX_REFERENCES) {
       showNotice("参考图最多 10 张。", "error");
@@ -216,17 +241,22 @@ async function handleFileInput(event) {
     }
 
     const value = await fileToDataUrl(file);
-    state.references.push({
+    const reference = {
       id: crypto.randomUUID(),
       type: "file",
       name: file.name,
       value
-    });
+    };
+    state.references.push(reference);
+    latestReference = reference;
   }
 
   els.imageFiles.value = "";
   renderReferences();
   updateRequestPreview();
+  if (latestReference) {
+    void matchReferenceAspectRatio(latestReference);
+  }
 }
 
 function addImageUrl() {
@@ -243,15 +273,17 @@ function addImageUrl() {
     return;
   }
 
-  state.references.push({
+  const reference = {
     id: crypto.randomUUID(),
     type: "url",
     name: shortName(value),
     value
-  });
+  };
+  state.references.push(reference);
   els.imageUrl.value = "";
   renderReferences();
   updateRequestPreview();
+  void matchReferenceAspectRatio(reference);
 }
 
 function renderReferences() {
@@ -299,16 +331,59 @@ function fileToDataUrl(file) {
   });
 }
 
-function buildPayload({ preview = false } = {}) {
-  const basePrompt = els.prompt.value.trim();
-  let prompt = basePrompt;
-  if (els.sizeMode.value === "level" && els.aspectRatio.value !== "auto" && basePrompt) {
-    prompt = `${basePrompt}\n\n画面比例：${els.aspectRatio.value}。`;
+async function matchReferenceAspectRatio(reference) {
+  try {
+    const { width, height } = await loadImageDimensions(reference.value);
+    const latestReference = state.references[state.references.length - 1];
+    if (state.mode !== "image" || latestReference?.id !== reference.id) return;
+
+    const closestRatio = findClosestAspectRatio(width, height);
+    if (!closestRatio) return;
+
+    els.aspectRatio.value = closestRatio;
+    refreshConditionalFields();
+    updateRequestPreview();
+  } catch {
+    // Some remote image hosts block browser loading. Keep the current ratio in that case.
+  }
+}
+
+function loadImageDimensions(source) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
+    image.onerror = () => reject(new Error("无法读取参考图尺寸。"));
+    image.src = source;
+  });
+}
+
+function findClosestAspectRatio(width, height) {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return null;
   }
 
+  const targetRatio = width / height;
+  let closestRatio = null;
+  let closestDistance = Number.POSITIVE_INFINITY;
+
+  for (const ratio of supportedAspectRatios) {
+    const [ratioWidth, ratioHeight] = ratio.split(":").map(Number);
+    const candidateRatio = ratioWidth / ratioHeight;
+    const distance = Math.abs(Math.log(targetRatio / candidateRatio));
+    if (distance < closestDistance) {
+      closestRatio = ratio;
+      closestDistance = distance;
+    }
+  }
+
+  return closestRatio;
+}
+
+function buildPayload({ preview = false } = {}) {
   const size = els.sizeMode.value === "custom"
-    ? `${Number(els.width.value)}x${Number(els.height.value)}`
-    : els.sizeLevel.value;
+    ? getCustomSize()
+    : getPresetSize();
+  const prompt = els.prompt.value.trim();
 
   let extra = {};
   const rawExtra = els.extraJson.value.trim();
@@ -335,13 +410,48 @@ function buildPayload({ preview = false } = {}) {
   };
 
   if (!preview) {
-    if (!basePrompt) throw new Error("请先输入提示词。");
+    if (!prompt) throw new Error("请先输入提示词。");
     if (state.mode === "image" && state.references.length === 0) {
       throw new Error("图生图需要至少一张参考图。");
     }
   }
 
   return payload;
+}
+
+function getPresetSize() {
+  const level = els.sizeLevel.value.toUpperCase();
+  const ratio = els.aspectRatio.value;
+  if (ratio === "auto") return level;
+
+  const size = documentedSizePresets[level]?.[ratio];
+
+  if (!size) {
+    throw new Error("请选择有效的分辨率档位和图片比例。");
+  }
+
+  return size;
+}
+
+function getCustomSize() {
+  const width = Number(els.width.value);
+  const height = Number(els.height.value);
+
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+    throw new Error("请输入有效的自定义宽高。");
+  }
+
+  if (width % 16 !== 0 || height % 16 !== 0) {
+    throw new Error("自定义宽高必须是 16 的倍数。");
+  }
+
+  const pixels = width * height;
+  const aspect = width / height;
+  if (pixels < 921600 || pixels > 4624220 || aspect < 1 / 16 || aspect > 16) {
+    throw new Error("自定义尺寸需满足总像素 921,600–4,624,220，宽高比 1:16–16:1。");
+  }
+
+  return `${width}x${height}`;
 }
 
 function updateRequestPreview() {

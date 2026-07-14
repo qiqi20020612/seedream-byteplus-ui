@@ -455,10 +455,26 @@ pre {
 }
 
 .result-header {
+  flex-wrap: wrap;
   justify-content: space-between;
   gap: 14px;
   padding-bottom: 16px;
   border-bottom: 1px solid var(--line);
+}
+
+.result-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.result-header .generate-button {
+  width: auto;
+  min-height: 38px;
+  margin-top: 0;
+  padding: 0 18px;
 }
 
 .notice {

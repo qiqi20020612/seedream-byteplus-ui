@@ -18,6 +18,19 @@ const MAX_SAVED_IMAGE_BYTES = Number.parseInt(
   10
 );
 const REQUEST_TIMEOUT_MS = Number.parseInt(process.env.REQUEST_TIMEOUT_MS || "180000", 10);
+const STATUS_LOG_INTERVAL_MS = normalizeStatusLogInterval(process.env.STATUS_LOG_INTERVAL_MS);
+
+const RUNTIME_STATE = {
+  startedAt: new Date().toISOString(),
+  startedAtMs: Date.now(),
+  totalRequests: 0,
+  activeRequests: 0,
+  totalGenerations: 0,
+  succeededGenerations: 0,
+  failedGenerations: 0,
+  cancelledGenerations: 0,
+  activeGenerations: new Map()
+};
 
 const REGION_BASE_URLS = {
   "ap-southeast-1": "https://ark.ap-southeast.bytepluses.com/api/v3",
@@ -38,6 +51,8 @@ const MIME_TYPES = {
 };
 
 const server = http.createServer(async (req, res) => {
+  const requestContext = beginHttpRequest(req, res);
+
   try {
     if (req.method === "OPTIONS") {
       sendCors(res);
@@ -55,15 +70,21 @@ const server = http.createServer(async (req, res) => {
         hasEnvKey: Boolean(getEnvApiKey()),
         outputDir: OUTPUT_DIR,
         defaultBaseUrl: process.env.ARK_BASE_URL || REGION_BASE_URLS["ap-southeast-1"],
-        regions: REGION_BASE_URLS
+        regions: REGION_BASE_URLS,
+        runtime: getRuntimeSnapshot({ excludeCurrentRequest: true })
       });
       return;
     }
 
     if (req.method === "POST" && requestUrl.pathname === "/api/generate") {
       const generationController = new AbortController();
+      let generationStarted = false;
       const cancelOnDisconnect = () => {
-        if (!res.writableEnded) generationController.abort();
+        if (!res.writableEnded && !generationController.signal.aborted) {
+          generationController.abort();
+          updateGenerationStage(requestContext.id, "cancelling");
+          logEvent("WARN", "GENERATE", requestContext.id, "client disconnected; cancelling generation");
+        }
       };
       if (typeof res.once === "function") {
         res.once("close", cancelOnDisconnect);
@@ -72,14 +93,57 @@ const server = http.createServer(async (req, res) => {
       try {
         const input = await readJsonBody(req);
         const { apiKey, endpoint, providerBody, safeRequest } = buildProviderRequest(input);
-        const provider = await callBytePlus(endpoint, apiKey, providerBody, generationController.signal);
+        const summary = summarizeGenerationRequest(input, providerBody, endpoint);
+        beginGeneration(requestContext.id, summary);
+        generationStarted = true;
+
+        updateGenerationStage(requestContext.id, "requesting_byteplus");
+        const providerStartedAt = Date.now();
+        logEvent("INFO", "UPSTREAM", requestContext.id, "BytePlus request started", {
+          endpoint: summary.endpoint,
+          model: MODEL_ID,
+          size: providerBody.size,
+          referenceImages: summary.referenceImages
+        });
+        const upstream = await callBytePlus(endpoint, apiKey, providerBody, generationController.signal);
+        const provider = upstream.payload;
+        const generatedImages = Array.isArray(provider && provider.data) ? provider.data.length : 0;
+        logEvent("INFO", "UPSTREAM", requestContext.id, "BytePlus response received", {
+          status: upstream.status,
+          durationMs: Date.now() - providerStartedAt,
+          providerRequestId: upstream.requestId,
+          generatedImages,
+          usage: summarizeProviderUsage(provider)
+        });
+
+        updateGenerationStage(requestContext.id, "saving_images");
+        const saveStartedAt = Date.now();
+        logEvent("INFO", "SAVE", requestContext.id, "saving generated images", {
+          images: generatedImages,
+          outputDir: OUTPUT_DIR
+        });
         const savedResult = await saveGeneratedImages(
           provider,
           providerBody.output_format,
           generationController.signal
         );
+        logEvent("INFO", "SAVE", requestContext.id, "image saving finished", {
+          durationMs: Date.now() - saveStartedAt,
+          saved: savedResult.files.length,
+          failed: savedResult.errors.length,
+          bytes: savedResult.files.reduce((total, file) => total + (file.bytes || 0), 0),
+          files: savedResult.files.map((file) => file.fileName)
+        });
+
+        finishGeneration(requestContext.id, "succeeded", {
+          generatedImages,
+          savedImages: savedResult.files.length,
+          saveErrors: savedResult.errors.length
+        });
+        generationStarted = false;
         sendJson(res, 200, {
           ok: true,
+          requestId: requestContext.id,
           model: MODEL_ID,
           endpoint,
           request: safeRequest,
@@ -88,6 +152,15 @@ const server = http.createServer(async (req, res) => {
           outputDir: OUTPUT_DIR,
           provider
         });
+      } catch (error) {
+        if (generationStarted) {
+          const outcome = error.status === 499 || generationController.signal.aborted
+            ? "cancelled"
+            : "failed";
+          finishGeneration(requestContext.id, outcome, { error: error.message });
+          generationStarted = false;
+        }
+        throw error;
       } finally {
         if (typeof res.off === "function") {
           res.off("close", cancelOnDisconnect);
@@ -108,10 +181,23 @@ const server = http.createServer(async (req, res) => {
 
     sendJson(res, 405, { ok: false, error: "Method not allowed." });
   } catch (error) {
-    if (res.destroyed || res.writableEnded) return;
     const status = error.statusCode || error.status || 500;
+    logEvent(status >= 500 ? "ERROR" : "WARN", "HTTP", requestContext.id, "request failed", {
+      method: requestContext.method,
+      path: requestContext.path,
+      status,
+      error: error.message || "Unknown error"
+    });
+    if (!error.expose && error.stack) {
+      logEvent("ERROR", "SERVER", requestContext.id, "internal error stack", {
+        stack: truncateLogText(error.stack, 1200)
+      });
+    }
+
+    if (res.destroyed || res.writableEnded) return;
     sendJson(res, status, {
       ok: false,
+      requestId: requestContext.id,
       error: error.expose ? error.message : "Server error.",
       detail: error.detail
     });
@@ -119,6 +205,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 listenWithFallback(DEFAULT_PORT);
+startStatusHeartbeat();
 
 function loadEnvFile() {
   const envPath = path.join(__dirname, ".env");
@@ -147,16 +234,244 @@ function loadEnvFile() {
   }
 }
 
+function normalizeStatusLogInterval(value) {
+  const parsed = Number.parseInt(value || "10000", 10);
+  if (parsed === 0) return 0;
+  return Number.isFinite(parsed) && parsed >= 1000 ? parsed : 10000;
+}
+
+function beginHttpRequest(req, res) {
+  const id = randomUUID().slice(0, 8);
+  const startedAt = Date.now();
+  const method = String(req.method || "UNKNOWN").toUpperCase();
+  const requestPath = getRequestPath(req.url);
+  const rawContentLength = Array.isArray(req.headers["content-length"])
+    ? req.headers["content-length"][0]
+    : req.headers["content-length"];
+  const contentLength = Number.parseInt(rawContentLength || "0", 10);
+
+  RUNTIME_STATE.totalRequests += 1;
+  RUNTIME_STATE.activeRequests += 1;
+  res.setHeader("X-Request-Id", id);
+  logEvent("INFO", "HTTP", id, "request started", {
+    method,
+    path: requestPath,
+    contentLength: Number.isFinite(contentLength) && contentLength > 0 ? contentLength : undefined
+  });
+
+  let settled = false;
+  const settle = (reason) => {
+    if (settled) return;
+    settled = true;
+    RUNTIME_STATE.activeRequests = Math.max(0, RUNTIME_STATE.activeRequests - 1);
+    const status = res.statusCode || 0;
+    const level = status >= 500 ? "ERROR" : status >= 400 || reason !== "finished" ? "WARN" : "INFO";
+    logEvent(level, "HTTP", id, "request finished", {
+      method,
+      path: requestPath,
+      status,
+      durationMs: Date.now() - startedAt,
+      reason
+    });
+  };
+
+  res.once("finish", () => settle("finished"));
+  res.once("close", () => settle(res.writableEnded ? "finished" : "connection_closed"));
+
+  return { id, startedAt, method, path: requestPath };
+}
+
+function getRequestPath(rawUrl) {
+  try {
+    return new URL(rawUrl || "/", "http://127.0.0.1").pathname;
+  } catch {
+    return truncateLogText(rawUrl || "/", 200);
+  }
+}
+
+function logEvent(level, scope, requestId, message, details) {
+  const timestamp = new Date().toISOString();
+  const normalizedLevel = String(level || "INFO").toUpperCase();
+  const normalizedScope = String(scope || "SERVER").toUpperCase();
+  const id = requestId || "--------";
+  let suffix = "";
+  if (details && Object.values(details).some((value) => value !== undefined)) {
+    suffix = ` ${JSON.stringify(details)}`;
+  }
+
+  const line = `${timestamp} ${normalizedLevel.padEnd(5)} [${normalizedScope}] [${id}] ${message}${suffix}`;
+  if (normalizedLevel === "ERROR") {
+    console.error(line);
+  } else if (normalizedLevel === "WARN") {
+    console.warn(line);
+  } else {
+    console.log(line);
+  }
+}
+
+function truncateLogText(value, maxLength = 180) {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function sanitizeLogUrl(value) {
+  try {
+    const parsed = new URL(String(value));
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return truncateLogText(value, 240);
+  }
+}
+
+function summarizeGenerationRequest(input, providerBody, endpoint) {
+  const rawImages = providerBody.image
+    ? (Array.isArray(providerBody.image) ? providerBody.image : [providerBody.image])
+    : [];
+  const referenceSources = rawImages.reduce(
+    (counts, image) => {
+      if (typeof image === "string" && image.startsWith("data:")) {
+        counts.dataUrl += 1;
+      } else {
+        counts.url += 1;
+      }
+      return counts;
+    },
+    { dataUrl: 0, url: 0 }
+  );
+
+  return {
+    mode: input.mode === "image" ? "image-to-image" : "text-to-image",
+    size: providerBody.size,
+    outputFormat: providerBody.output_format,
+    responseFormat: providerBody.response_format,
+    watermark: providerBody.watermark,
+    referenceImages: rawImages.length,
+    referenceSources,
+    promptPreview: truncateLogText(providerBody.prompt, 180),
+    extraKeys: input.extra && typeof input.extra === "object" && !Array.isArray(input.extra)
+      ? Object.keys(input.extra)
+      : [],
+    apiKeySource: String(input.apiKey || "").trim() ? "request" : "environment",
+    endpoint: sanitizeLogUrl(endpoint)
+  };
+}
+
+function beginGeneration(requestId, summary) {
+  const now = Date.now();
+  RUNTIME_STATE.totalGenerations += 1;
+  RUNTIME_STATE.activeGenerations.set(requestId, {
+    ...summary,
+    requestId,
+    stage: "accepted",
+    startedAt: now,
+    updatedAt: now
+  });
+  logEvent("INFO", "GENERATE", requestId, "generation accepted", summary);
+}
+
+function updateGenerationStage(requestId, stage) {
+  const generation = RUNTIME_STATE.activeGenerations.get(requestId);
+  if (!generation) return;
+  generation.stage = stage;
+  generation.updatedAt = Date.now();
+}
+
+function finishGeneration(requestId, outcome, details = {}) {
+  const generation = RUNTIME_STATE.activeGenerations.get(requestId);
+  if (!generation) return;
+  RUNTIME_STATE.activeGenerations.delete(requestId);
+
+  if (outcome === "succeeded") {
+    RUNTIME_STATE.succeededGenerations += 1;
+  } else if (outcome === "cancelled") {
+    RUNTIME_STATE.cancelledGenerations += 1;
+  } else {
+    RUNTIME_STATE.failedGenerations += 1;
+  }
+
+  const level = outcome === "succeeded" ? "INFO" : outcome === "cancelled" ? "WARN" : "ERROR";
+  logEvent(level, "GENERATE", requestId, `generation ${outcome}`, {
+    durationMs: Date.now() - generation.startedAt,
+    finalStage: generation.stage,
+    ...details,
+    error: details.error ? truncateLogText(details.error, 500) : undefined
+  });
+}
+
+function summarizeProviderUsage(provider) {
+  const usage = provider && provider.usage;
+  if (!usage || typeof usage !== "object") return undefined;
+  return {
+    generatedImages: usage.generated_images,
+    inputImages: usage.input_images,
+    outputTokens: usage.output_tokens,
+    totalTokens: usage.total_tokens
+  };
+}
+
+function getRuntimeSnapshot({ excludeCurrentRequest = false } = {}) {
+  const now = Date.now();
+  return {
+    startedAt: RUNTIME_STATE.startedAt,
+    uptimeSeconds: Math.floor((now - RUNTIME_STATE.startedAtMs) / 1000),
+    requests: {
+      active: Math.max(0, RUNTIME_STATE.activeRequests - (excludeCurrentRequest ? 1 : 0)),
+      total: RUNTIME_STATE.totalRequests
+    },
+    generations: {
+      active: RUNTIME_STATE.activeGenerations.size,
+      total: RUNTIME_STATE.totalGenerations,
+      succeeded: RUNTIME_STATE.succeededGenerations,
+      failed: RUNTIME_STATE.failedGenerations,
+      cancelled: RUNTIME_STATE.cancelledGenerations
+    },
+    activeGenerations: [...RUNTIME_STATE.activeGenerations.values()].map((generation) => ({
+      requestId: generation.requestId,
+      stage: generation.stage,
+      elapsedMs: now - generation.startedAt,
+      mode: generation.mode,
+      size: generation.size,
+      referenceImages: generation.referenceImages
+    }))
+  };
+}
+
+function startStatusHeartbeat() {
+  if (STATUS_LOG_INTERVAL_MS <= 0) return;
+  const timer = setInterval(() => {
+    if (RUNTIME_STATE.activeRequests === 0 && RUNTIME_STATE.activeGenerations.size === 0) return;
+    const snapshot = getRuntimeSnapshot();
+    logEvent("INFO", "STATUS", null, "runtime heartbeat", {
+      uptimeSeconds: snapshot.uptimeSeconds,
+      activeRequests: snapshot.requests.active,
+      activeGenerations: snapshot.generations.active,
+      generations: snapshot.activeGenerations
+    });
+  }, STATUS_LOG_INTERVAL_MS);
+  timer.unref();
+}
+
 function listenWithFallback(port, attempts = 0) {
   const nextPort = port + attempts;
 
   server.once("error", (error) => {
     if (error.code === "EADDRINUSE" && attempts < 20) {
+      logEvent("WARN", "SERVER", null, "port is in use; trying the next port", {
+        port: nextPort,
+        nextPort: nextPort + 1
+      });
       listenWithFallback(port, attempts + 1);
       return;
     }
 
-    console.error(error);
+    logEvent("ERROR", "SERVER", null, "server failed to start", {
+      error: error.message || String(error)
+    });
     process.exitCode = 1;
   });
 
@@ -176,7 +491,15 @@ function listenWithFallback(port, attempts = 0) {
       // Status file is a convenience only.
     }
 
-    console.log(`Seedream frontend ready at ${url}`);
+    logEvent("INFO", "SERVER", null, "Seedream frontend ready", {
+      url,
+      pid: process.pid,
+      model: MODEL_ID,
+      apiKey: getEnvApiKey() ? "configured" : "not_configured",
+      outputDir: OUTPUT_DIR,
+      requestTimeoutMs: REQUEST_TIMEOUT_MS,
+      statusLogIntervalMs: STATUS_LOG_INTERVAL_MS
+    });
   });
 }
 
@@ -363,6 +686,10 @@ function normalizeSize(value) {
   const height = Number.parseInt(match[2], 10);
   const pixels = width * height;
   const aspect = width / height;
+
+  if (width % 16 !== 0 || height % 16 !== 0) {
+    throw makeHttpError(400, "Custom width and height must be multiples of 16.");
+  }
 
   if (width <= 0 || height <= 0 || pixels < 921600 || pixels > 4624220 || aspect < 1 / 16 || aspect > 16) {
     throw makeHttpError(400, "Custom size is outside Seedream 5.0 Pro limits.");
@@ -567,7 +894,11 @@ async function callBytePlus(endpoint, apiKey, body, externalSignal) {
       throw makeHttpError(response.status, message, payload);
     }
 
-    return payload;
+    return {
+      payload,
+      status: response.status,
+      requestId: response.headers.get("x-request-id") || response.headers.get("x-tt-logid") || undefined
+    };
   } catch (error) {
     if (error.name === "AbortError") {
       if (externalSignal && externalSignal.aborted) {

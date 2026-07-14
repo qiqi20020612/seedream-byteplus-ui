@@ -96,13 +96,13 @@
             <label class="field" for="sizeMode">
               <span>尺寸模式</span>
               <select id="sizeMode">
-                <option value="level">清晰度</option>
-                <option value="custom">像素</option>
+                <option value="level">预设比例</option>
+                <option value="custom">自定义像素</option>
               </select>
             </label>
 
             <label class="field" for="sizeLevel" id="sizeLevelField">
-              <span>清晰度</span>
+              <span>分辨率档位</span>
               <select id="sizeLevel">
                 <option value="2K">2K</option>
                 <option value="1K">1K</option>
@@ -126,12 +126,12 @@
 
             <label class="field is-hidden" for="width" id="widthField">
               <span>宽</span>
-              <input id="width" type="number" min="128" max="6000" step="8" value="2048">
+              <input id="width" type="number" min="16" step="16" value="2048">
             </label>
 
             <label class="field is-hidden" for="height" id="heightField">
               <span>高</span>
-              <input id="height" type="number" min="128" max="6000" step="8" value="2048">
+              <input id="height" type="number" min="16" step="16" value="2048">
             </label>
 
             <label class="field" for="outputFormat">
@@ -165,11 +165,6 @@
             <summary>请求体</summary>
             <pre id="requestPreview"></pre>
           </details>
-
-          <button type="submit" class="generate-button" id="generateButton">
-            <span class="button-icon" data-icon="spark"></span>
-            生成
-          </button>
         </form>
       </section>
 
@@ -179,10 +174,16 @@
             <h2>结果</h2>
             <p id="resultMeta">等待生成</p>
           </div>
-          <button type="button" class="quiet-button" id="clearResults">
-            <span class="button-icon" data-icon="trash"></span>
-            清空
-          </button>
+          <div class="result-header-actions">
+            <button type="submit" form="generatorForm" class="generate-button" id="generateButton">
+              <span class="button-icon" data-icon="spark"></span>
+              生成
+            </button>
+            <button type="button" class="quiet-button" id="clearResults">
+              <span class="button-icon" data-icon="trash"></span>
+              清空
+            </button>
+          </div>
         </div>
 
         <div class="notice is-hidden" id="notice"></div>
