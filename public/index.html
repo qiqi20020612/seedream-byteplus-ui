@@ -2,8 +2,29 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" id="themeColor" content="#f4f6f4">
     <title>Seedream 5.0 Pro Studio</title>
+    <script>
+      (() => {
+        let preference = "system";
+        try {
+          const savedPreference = localStorage.getItem("seedream.ui.theme");
+          if (savedPreference === "light" || savedPreference === "dark") {
+            preference = savedPreference;
+          }
+        } catch {
+          // The system color scheme remains the fallback when storage is unavailable.
+        }
+
+        const resolvedTheme = preference === "system"
+          ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+          : preference;
+        document.documentElement.dataset.theme = resolvedTheme;
+        document.documentElement.dataset.themePreference = preference;
+        document.querySelector("#themeColor").content = resolvedTheme === "dark" ? "#0c1112" : "#f4f6f4";
+      })();
+    </script>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
@@ -16,12 +37,28 @@
         </div>
       </div>
       <div class="topbar-actions">
-        <span class="status-pill" id="serverStatus">连接中</span>
+        <span class="status-pill" id="serverStatus" aria-live="polite">连接中</span>
+        <button type="button" class="theme-toggle" id="themeToggle" aria-label="外观：跟随系统" title="外观：跟随系统">
+          <span class="theme-icon" id="themeIcon" aria-hidden="true"></span>
+          <span class="theme-label" id="themeLabel">跟随系统</span>
+        </button>
       </div>
     </header>
 
     <main class="app-grid">
-      <section class="control-panel" aria-label="生成设置">
+      <section class="control-panel" id="settingsDrawer" aria-labelledby="settingsDrawerTitle">
+        <header class="drawer-header">
+          <span class="drawer-handle" aria-hidden="true"></span>
+          <div class="drawer-heading">
+            <div>
+              <h2 id="settingsDrawerTitle">生成设置</h2>
+              <p>调整提示词、参考图与输出参数</p>
+            </div>
+            <button type="button" class="drawer-close" id="closeSettings" aria-label="收起生成设置" title="收起生成设置">
+              <span data-icon="close" aria-hidden="true"></span>
+            </button>
+          </div>
+        </header>
         <form id="generatorForm" class="generator-form">
           <div class="mode-switch" role="tablist" aria-label="模式">
             <button type="button" class="mode-button is-active" data-mode="text" role="tab" aria-selected="true">
@@ -175,6 +212,10 @@
             <p id="resultMeta">等待生成</p>
           </div>
           <div class="result-header-actions">
+            <button type="button" class="quiet-button mobile-settings-button" id="settingsToggle" aria-controls="settingsDrawer" aria-expanded="false">
+              <span class="button-icon" data-icon="sliders"></span>
+              <span id="settingsToggleLabel">参数</span>
+            </button>
             <button type="submit" form="generatorForm" class="generate-button" id="generateButton">
               <span class="button-icon" data-icon="spark"></span>
               生成
@@ -195,6 +236,25 @@
         </details>
       </section>
     </main>
+
+    <div class="drawer-backdrop" id="drawerBackdrop" aria-hidden="true"></div>
+
+    <dialog class="image-preview-dialog" id="imagePreviewDialog" aria-labelledby="imagePreviewTitle" aria-describedby="imagePreviewMeta" aria-hidden="true">
+      <div class="image-preview-shell">
+        <header class="image-preview-header">
+          <div>
+            <h2 id="imagePreviewTitle">图片预览</h2>
+            <p id="imagePreviewMeta">Seedream 生成结果</p>
+          </div>
+          <button type="button" class="image-preview-close" id="closeImagePreview" aria-label="关闭全屏预览" title="关闭全屏预览">
+            <span data-icon="close" aria-hidden="true"></span>
+          </button>
+        </header>
+        <div class="image-preview-stage">
+          <img id="imagePreviewImage" alt="">
+        </div>
+      </div>
+    </dialog>
 
     <script src="/app.js" defer></script>
   </body>

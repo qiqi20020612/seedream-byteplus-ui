@@ -1,6 +1,10 @@
 const STORAGE_KEY = "seedream.byteplus.apiKey";
+const THEME_STORAGE_KEY = "seedream.ui.theme";
+const THEME_PREFERENCES = ["system", "light", "dark"];
 const MAX_REFERENCES = 10;
 const MAX_REFERENCE_BYTES = 30 * 1024 * 1024;
+const themeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+const mobileDrawerMediaQuery = window.matchMedia("(max-width: 640px)");
 
 const regionBaseUrls = {
   "ap-southeast-1": "https://ark.ap-southeast.bytepluses.com/api/v3",
@@ -36,11 +40,27 @@ const state = {
   references: [],
   lastPayload: null,
   modelId: "",
-  generations: new Map()
+  generations: new Map(),
+  themePreference: "system",
+  settingsOpen: false,
+  previewTrigger: null
 };
 
 const els = {
   form: document.querySelector("#generatorForm"),
+  themeColor: document.querySelector("#themeColor"),
+  themeToggle: document.querySelector("#themeToggle"),
+  themeIcon: document.querySelector("#themeIcon"),
+  themeLabel: document.querySelector("#themeLabel"),
+  settingsDrawer: document.querySelector("#settingsDrawer"),
+  settingsToggle: document.querySelector("#settingsToggle"),
+  settingsToggleLabel: document.querySelector("#settingsToggleLabel"),
+  closeSettings: document.querySelector("#closeSettings"),
+  drawerBackdrop: document.querySelector("#drawerBackdrop"),
+  imagePreviewDialog: document.querySelector("#imagePreviewDialog"),
+  imagePreviewImage: document.querySelector("#imagePreviewImage"),
+  imagePreviewMeta: document.querySelector("#imagePreviewMeta"),
+  closeImagePreview: document.querySelector("#closeImagePreview"),
   modelName: document.querySelector("#modelName"),
   serverStatus: document.querySelector("#serverStatus"),
   prompt: document.querySelector("#prompt"),
@@ -89,9 +109,13 @@ const icons = {
   trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M6 7l1 14h10l1-14"/><path d="M9 7V4h6v3"/></svg>',
   spark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 9 10l-7 3 7 3 4 8 4-8 7-3-7-3-4-8Z"/></svg>',
   copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M4 16V6a2 2 0 0 1 2-2h10"/></svg>',
-  external: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3h7v7"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>',
+  expand: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/><path d="m3 8 6-6M21 8l-6-6M3 16l6 6M21 16l-6 6"/></svg>',
   download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>',
-  close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>'
+  close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>',
+  system: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
+  sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></svg>',
+  moon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.4 15.4A8.5 8.5 0 0 1 8.6 3.6 8.5 8.5 0 1 0 20.4 15.4Z"/></svg>',
+  sliders: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg>'
 };
 
 document.querySelectorAll("[data-icon]").forEach((node) => {
@@ -101,6 +125,8 @@ document.querySelectorAll("[data-icon]").forEach((node) => {
 bootstrap();
 
 function bootstrap() {
+  initializeTheme();
+
   const savedKey = localStorage.getItem(STORAGE_KEY);
   if (savedKey) {
     els.apiKey.value = savedKey;
@@ -108,6 +134,7 @@ function bootstrap() {
   }
 
   bindEvents();
+  syncSettingsDrawerMode();
   refreshConditionalFields();
   renderReferences();
   updateRequestPreview();
@@ -115,6 +142,52 @@ function bootstrap() {
 }
 
 function bindEvents() {
+  els.themeToggle.addEventListener("click", () => {
+    applyTheme(getNextThemePreference(), { persist: true });
+  });
+
+  const handleSystemThemeChange = () => {
+    applyTheme(state.themePreference);
+  };
+  if (typeof themeMediaQuery.addEventListener === "function") {
+    themeMediaQuery.addEventListener("change", handleSystemThemeChange);
+  } else {
+    themeMediaQuery.addListener(handleSystemThemeChange);
+  }
+
+  els.settingsToggle.addEventListener("click", toggleSettingsDrawer);
+  els.closeSettings.addEventListener("click", () => closeSettingsDrawer());
+  els.drawerBackdrop.addEventListener("click", () => closeSettingsDrawer());
+  els.closeImagePreview.addEventListener("click", closeImagePreview);
+  els.imagePreviewDialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeImagePreview();
+  });
+  els.imagePreviewDialog.addEventListener("click", (event) => {
+    if (event.target === els.imagePreviewDialog) closeImagePreview();
+  });
+  els.imagePreviewDialog.addEventListener("close", resetImagePreview);
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+
+    if (els.imagePreviewDialog.open) {
+      event.preventDefault();
+      closeImagePreview();
+      return;
+    }
+
+    if (state.settingsOpen) {
+      closeSettingsDrawer();
+    }
+  });
+
+  const handleDrawerBreakpointChange = () => syncSettingsDrawerMode();
+  if (typeof mobileDrawerMediaQuery.addEventListener === "function") {
+    mobileDrawerMediaQuery.addEventListener("change", handleDrawerBreakpointChange);
+  } else {
+    mobileDrawerMediaQuery.addListener(handleDrawerBreakpointChange);
+  }
+
   els.modeButtons.forEach((button) => {
     button.addEventListener("click", () => setMode(button.dataset.mode));
   });
@@ -164,6 +237,168 @@ function bindEvents() {
       updateRequestPreview();
     });
   });
+}
+
+function initializeTheme() {
+  let preference = "system";
+  try {
+    const savedPreference = localStorage.getItem(THEME_STORAGE_KEY);
+    if (THEME_PREFERENCES.includes(savedPreference)) {
+      preference = savedPreference;
+    }
+  } catch {
+    // Keep following the system theme when storage is unavailable.
+  }
+
+  applyTheme(preference);
+}
+
+function applyTheme(preference, { persist = false } = {}) {
+  const normalizedPreference = THEME_PREFERENCES.includes(preference) ? preference : "system";
+  const resolvedTheme = normalizedPreference === "system"
+    ? (themeMediaQuery.matches ? "dark" : "light")
+    : normalizedPreference;
+
+  state.themePreference = normalizedPreference;
+  document.documentElement.dataset.theme = resolvedTheme;
+  document.documentElement.dataset.themePreference = normalizedPreference;
+  els.themeColor.content = resolvedTheme === "dark" ? "#0c1112" : "#f4f6f4";
+
+  if (persist) {
+    try {
+      if (normalizedPreference === "system") {
+        localStorage.removeItem(THEME_STORAGE_KEY);
+      } else {
+        localStorage.setItem(THEME_STORAGE_KEY, normalizedPreference);
+      }
+    } catch {
+      // The theme still applies for this session when storage is unavailable.
+    }
+  }
+
+  updateThemeControl(resolvedTheme);
+}
+
+function getNextThemePreference() {
+  const systemTheme = themeMediaQuery.matches ? "dark" : "light";
+  const oppositeTheme = systemTheme === "dark" ? "light" : "dark";
+
+  if (state.themePreference === "system") return oppositeTheme;
+  if (state.themePreference === oppositeTheme) return systemTheme;
+  return "system";
+}
+
+function updateThemeControl(resolvedTheme) {
+  const themeDetails = {
+    system: { label: "跟随系统", icon: "system" },
+    light: { label: "浅色模式", icon: "sun" },
+    dark: { label: "深色模式", icon: "moon" }
+  };
+  const current = themeDetails[state.themePreference];
+  const next = themeDetails[getNextThemePreference()];
+
+  els.themeIcon.innerHTML = icons[current.icon];
+  els.themeLabel.textContent = current.label;
+  els.themeToggle.dataset.resolvedTheme = resolvedTheme;
+  els.themeToggle.title = `当前：${current.label}。点击切换到${next.label}`;
+  els.themeToggle.setAttribute("aria-label", els.themeToggle.title);
+}
+
+function syncSettingsDrawerMode() {
+  if (mobileDrawerMediaQuery.matches) {
+    els.settingsDrawer.setAttribute("role", "dialog");
+    els.settingsDrawer.setAttribute("aria-hidden", String(!state.settingsOpen));
+    els.settingsDrawer.inert = !state.settingsOpen;
+    els.drawerBackdrop.setAttribute("aria-hidden", "true");
+    els.settingsToggle.setAttribute("aria-expanded", String(state.settingsOpen));
+    els.settingsToggle.setAttribute("aria-label", state.settingsOpen ? "收起生成参数" : "打开生成参数");
+    els.settingsToggleLabel.textContent = state.settingsOpen ? "收起" : "参数";
+    return;
+  }
+
+  setSettingsDrawerOpen(false, { restoreFocus: false });
+  els.settingsDrawer.removeAttribute("role");
+  els.settingsDrawer.removeAttribute("aria-hidden");
+  els.settingsDrawer.inert = false;
+  els.drawerBackdrop.setAttribute("aria-hidden", "true");
+}
+
+function toggleSettingsDrawer() {
+  setSettingsDrawerOpen(!state.settingsOpen);
+}
+
+function closeSettingsDrawer({ restoreFocus = true } = {}) {
+  setSettingsDrawerOpen(false, { restoreFocus });
+}
+
+function setSettingsDrawerOpen(open, { restoreFocus = false } = {}) {
+  const wasOpen = state.settingsOpen;
+  const shouldOpen = Boolean(open && mobileDrawerMediaQuery.matches);
+  state.settingsOpen = shouldOpen;
+
+  els.settingsDrawer.classList.toggle("is-drawer-open", shouldOpen);
+  els.drawerBackdrop.classList.toggle("is-visible", shouldOpen);
+  document.body.classList.toggle("drawer-open", shouldOpen);
+  els.settingsToggle.setAttribute("aria-expanded", String(shouldOpen));
+  els.settingsToggle.setAttribute("aria-label", shouldOpen ? "收起生成参数" : "打开生成参数");
+  els.settingsToggleLabel.textContent = shouldOpen ? "收起" : "参数";
+
+  if (mobileDrawerMediaQuery.matches) {
+    els.settingsDrawer.setAttribute("aria-hidden", String(!shouldOpen));
+    els.settingsDrawer.inert = !shouldOpen;
+    els.drawerBackdrop.setAttribute("aria-hidden", "true");
+  }
+
+  if (shouldOpen) {
+    requestAnimationFrame(() => els.closeSettings.focus({ preventScroll: true }));
+  } else if (restoreFocus && wasOpen && mobileDrawerMediaQuery.matches) {
+    els.settingsToggle.focus({ preventScroll: true });
+  }
+}
+
+function openImagePreview(source, alt, trigger) {
+  if (!source || !source.src) return;
+
+  state.previewTrigger = trigger instanceof HTMLElement ? trigger : null;
+  els.imagePreviewImage.src = source.src;
+  els.imagePreviewImage.alt = alt || "Seedream 生成结果大图";
+  els.imagePreviewMeta.textContent = source.label || "Seedream 生成结果";
+  els.imagePreviewDialog.removeAttribute("aria-hidden");
+  document.body.classList.add("image-preview-open");
+
+  if (!els.imagePreviewDialog.open) {
+    if (typeof els.imagePreviewDialog.showModal === "function") {
+      els.imagePreviewDialog.showModal();
+    } else {
+      els.imagePreviewDialog.setAttribute("open", "");
+    }
+  }
+
+  requestAnimationFrame(() => els.closeImagePreview.focus({ preventScroll: true }));
+}
+
+function closeImagePreview() {
+  if (els.imagePreviewDialog.open && typeof els.imagePreviewDialog.close === "function") {
+    els.imagePreviewDialog.close();
+    return;
+  }
+
+  els.imagePreviewDialog.removeAttribute("open");
+  resetImagePreview();
+}
+
+function resetImagePreview() {
+  const trigger = state.previewTrigger;
+  state.previewTrigger = null;
+  document.body.classList.remove("image-preview-open");
+  els.imagePreviewDialog.setAttribute("aria-hidden", "true");
+  els.imagePreviewImage.removeAttribute("src");
+  els.imagePreviewImage.alt = "";
+  els.imagePreviewMeta.textContent = "Seedream 生成结果";
+
+  if (trigger && trigger.isConnected) {
+    trigger.focus({ preventScroll: true });
+  }
 }
 
 async function checkServer() {
@@ -487,11 +722,17 @@ async function handleSubmit(event) {
     payload = buildPayload();
   } catch (error) {
     showNotice(error.message, "error");
+    if (mobileDrawerMediaQuery.matches) {
+      closeSettingsDrawer({ restoreFocus: false });
+    }
     return;
   }
 
   const task = createGenerationTask(payload);
   state.lastPayload = payload;
+  if (mobileDrawerMediaQuery.matches) {
+    closeSettingsDrawer({ restoreFocus: false });
+  }
 
   try {
     const response = await fetch("/api/generate", {
@@ -554,7 +795,22 @@ function createResultCard(item, saved, index, outputFormat) {
   const image = document.createElement("img");
   image.src = source.src;
   image.alt = `Seedream result ${index + 1}`;
-  card.append(image);
+  image.loading = "lazy";
+  image.decoding = "async";
+
+  if (source.src) {
+    const imageButton = document.createElement("button");
+    imageButton.type = "button";
+    imageButton.className = "result-image-button";
+    imageButton.setAttribute("aria-label", `全屏预览第 ${index + 1} 张生成图片`);
+    imageButton.setAttribute("aria-haspopup", "dialog");
+    imageButton.title = "全屏预览";
+    imageButton.append(image);
+    imageButton.addEventListener("click", () => openImagePreview(source, image.alt, imageButton));
+    card.append(imageButton);
+  } else {
+    card.append(image);
+  }
 
   const body = document.createElement("div");
   body.className = "result-card-body";
@@ -567,12 +823,12 @@ function createResultCard(item, saved, index, outputFormat) {
   actions.className = "result-actions";
 
   if (source.src) {
-    const open = document.createElement("a");
-    open.href = source.src;
-    open.target = "_blank";
-    open.rel = "noreferrer";
-    open.innerHTML = `${icons.external}打开`;
-    actions.append(open);
+    const preview = document.createElement("button");
+    preview.type = "button";
+    preview.setAttribute("aria-haspopup", "dialog");
+    preview.innerHTML = `${icons.expand}预览`;
+    preview.addEventListener("click", () => openImagePreview(source, image.alt, preview));
+    actions.append(preview);
   }
 
   if (source.copyValue) {
