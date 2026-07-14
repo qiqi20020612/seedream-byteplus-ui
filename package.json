@@ -1,0 +1,14 @@
+{
+  "name": "seedream-byteplus-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local front end and proxy for BytePlus Seedream 5.0 Pro image generation.",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "check": "node --check server.js && node --check public/app.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

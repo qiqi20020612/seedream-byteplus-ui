@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Seedream 5.0 Pro Studio</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <h1>Seedream Studio</h1>
+          <p>dola-seedream-5-0-pro-260628</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span class="status-pill" id="serverStatus">连接中</span>
+      </div>
+    </header>
+
+    <main class="app-grid">
+      <section class="control-panel" aria-label="生成设置">
+        <form id="generatorForm" class="generator-form">
+          <div class="mode-switch" role="tablist" aria-label="模式">
+            <button type="button" class="mode-button is-active" data-mode="text" role="tab" aria-selected="true">
+              <span class="button-icon" data-icon="text"></span>
+              文生图
+            </button>
+            <button type="button" class="mode-button" data-mode="image" role="tab" aria-selected="false">
+              <span class="button-icon" data-icon="image"></span>
+              图生图
+            </button>
+          </div>
+
+          <label class="field field-tall" for="prompt">
+            <span>提示词</span>
+            <textarea id="prompt" name="prompt" rows="8" maxlength="8000" placeholder="Vibrant close-up editorial portrait, rich color blocking, dramatic studio lighting."></textarea>
+          </label>
+
+          <div class="prompt-tools">
+            <span id="promptCount">0 / 8000</span>
+            <button type="button" class="quiet-button" id="clearPrompt">
+              <span class="button-icon" data-icon="eraser"></span>
+              清空
+            </button>
+          </div>
+
+          <fieldset class="image-panel is-hidden" id="imagePanel">
+            <legend>参考图</legend>
+            <div class="file-row">
+              <label class="file-picker" for="imageFiles">
+                <span class="button-icon" data-icon="upload"></span>
+                本地图片
+              </label>
+              <input id="imageFiles" type="file" accept="image/jpeg,image/png,image/webp,image/bmp,image/tiff,image/gif,image/heic,image/heif" multiple>
+              <span class="counter" id="imageCount">0 / 10</span>
+            </div>
+
+            <div class="url-row">
+              <input id="imageUrl" type="url" placeholder="https://example.com/image.png" autocomplete="off">
+              <button type="button" class="icon-button" id="addImageUrl" aria-label="添加图片 URL" title="添加图片 URL">
+                <span data-icon="plus"></span>
+              </button>
+            </div>
+
+            <div class="reference-list" id="referenceList"></div>
+          </fieldset>
+
+          <div class="settings-grid">
+            <label class="field" for="apiKey">
+              <span>API Key</span>
+              <input id="apiKey" type="password" autocomplete="off" placeholder="ARK_API_KEY">
+            </label>
+
+            <label class="field" for="region">
+              <span>区域</span>
+              <select id="region">
+                <option value="ap-southeast-1">ap-southeast-1</option>
+                <option value="eu-west-1">eu-west-1</option>
+                <option value="custom">自定义</option>
+              </select>
+            </label>
+
+            <label class="field field-wide is-hidden" id="baseUrlField" for="baseUrl">
+              <span>Base URL</span>
+              <input id="baseUrl" type="url" value="https://ark.ap-southeast.bytepluses.com/api/v3">
+            </label>
+
+            <label class="check-row field-wide" for="rememberKey">
+              <input id="rememberKey" type="checkbox">
+              <span>记住 API Key</span>
+            </label>
+
+            <label class="field" for="sizeMode">
+              <span>尺寸模式</span>
+              <select id="sizeMode">
+                <option value="level">清晰度</option>
+                <option value="custom">像素</option>
+              </select>
+            </label>
+
+            <label class="field" for="sizeLevel" id="sizeLevelField">
+              <span>清晰度</span>
+              <select id="sizeLevel">
+                <option value="2K">2K</option>
+                <option value="1K">1K</option>
+              </select>
+            </label>
+
+            <label class="field" for="aspectRatio" id="aspectField">
+              <span>比例</span>
+              <select id="aspectRatio">
+                <option value="auto">自动</option>
+                <option value="1:1">1:1</option>
+                <option value="4:3">4:3</option>
+                <option value="3:4">3:4</option>
+                <option value="16:9">16:9</option>
+                <option value="9:16">9:16</option>
+                <option value="3:2">3:2</option>
+                <option value="2:3">2:3</option>
+                <option value="21:9">21:9</option>
+              </select>
+            </label>
+
+            <label class="field is-hidden" for="width" id="widthField">
+              <span>宽</span>
+              <input id="width" type="number" min="128" max="6000" step="8" value="2048">
+            </label>
+
+            <label class="field is-hidden" for="height" id="heightField">
+              <span>高</span>
+              <input id="height" type="number" min="128" max="6000" step="8" value="2048">
+            </label>
+
+            <label class="field" for="outputFormat">
+              <span>输出</span>
+              <select id="outputFormat">
+                <option value="png">png</option>
+                <option value="jpeg">jpeg</option>
+              </select>
+            </label>
+
+            <label class="field" for="responseFormat">
+              <span>返回</span>
+              <select id="responseFormat">
+                <option value="url">url</option>
+                <option value="b64_json">b64_json</option>
+              </select>
+            </label>
+
+            <label class="check-row" for="watermark">
+              <input id="watermark" type="checkbox">
+              <span>水印</span>
+            </label>
+          </div>
+
+          <details class="advanced-panel">
+            <summary>高级 JSON</summary>
+            <textarea id="extraJson" rows="6" spellcheck="false" placeholder="{ }"></textarea>
+          </details>
+
+          <details class="request-panel" open>
+            <summary>请求体</summary>
+            <pre id="requestPreview"></pre>
+          </details>
+
+          <button type="submit" class="generate-button" id="generateButton">
+            <span class="button-icon" data-icon="spark"></span>
+            生成
+          </button>
+        </form>
+      </section>
+
+      <section class="result-panel" aria-label="生成结果">
+        <div class="result-header">
+          <div>
+            <h2>结果</h2>
+            <p id="resultMeta">等待生成</p>
+          </div>
+          <button type="button" class="quiet-button" id="clearResults">
+            <span class="button-icon" data-icon="trash"></span>
+            清空
+          </button>
+        </div>
+
+        <div class="notice is-hidden" id="notice"></div>
+        <div class="result-grid is-empty" id="resultGrid"></div>
+
+        <details class="raw-panel">
+          <summary>原始响应</summary>
+          <pre id="rawResponse"></pre>
+        </details>
+      </section>
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>
