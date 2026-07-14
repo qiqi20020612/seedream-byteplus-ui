@@ -6,6 +6,26 @@ const { URL } = require("node:url");
 
 loadEnvFile();
 
+const LOG_LEVEL_PRIORITIES = Object.freeze({
+  silent: -1,
+  error: 0,
+  warn: 1,
+  info: 2,
+  debug: 3
+});
+const LOG_LEVEL_ALIASES = Object.freeze({
+  silent: "silent",
+  none: "silent",
+  off: "silent",
+  error: "error",
+  warn: "warn",
+  warning: "warn",
+  info: "info",
+  debug: "debug",
+  trace: "debug"
+});
+const LOG_LEVEL_INPUT = String(process.env.LOG_LEVEL || "info").trim().toLowerCase();
+const LOG_LEVEL = normalizeLogLevel(LOG_LEVEL_INPUT);
 const PUBLIC_DIR = path.join(__dirname, "public");
 const STATUS_FILE = path.join(__dirname, ".seedream-server.json");
 const OUTPUT_DIR = path.resolve(__dirname, process.env.OUTPUT_DIR || "generated");
@@ -21,7 +41,7 @@ const REQUEST_TIMEOUT_MS = Number.parseInt(process.env.REQUEST_TIMEOUT_MS || "18
 const STATUS_LOG_INTERVAL_MS = normalizeStatusLogInterval(process.env.STATUS_LOG_INTERVAL_MS);
 
 const RUNTIME_STATE = {
-  startedAt: new Date().toISOString(),
+  startedAt: formatLocalDateTime(new Date()),
   startedAtMs: Date.now(),
   totalRequests: 0,
   activeRequests: 0,
@@ -71,6 +91,10 @@ const server = http.createServer(async (req, res) => {
         outputDir: OUTPUT_DIR,
         defaultBaseUrl: process.env.ARK_BASE_URL || REGION_BASE_URLS["ap-southeast-1"],
         regions: REGION_BASE_URLS,
+        logging: {
+          level: LOG_LEVEL,
+          statusIntervalMs: STATUS_LOG_INTERVAL_MS
+        },
         runtime: getRuntimeSnapshot({ excludeCurrentRequest: true })
       });
       return;
@@ -83,7 +107,7 @@ const server = http.createServer(async (req, res) => {
         if (!res.writableEnded && !generationController.signal.aborted) {
           generationController.abort();
           updateGenerationStage(requestContext.id, "cancelling");
-          logEvent("WARN", "GENERATE", requestContext.id, "client disconnected; cancelling generation");
+          logEvent("DEBUG", "GENERATE", requestContext.id, "client disconnected; cancelling generation");
         }
       };
       if (typeof res.once === "function") {
@@ -99,7 +123,7 @@ const server = http.createServer(async (req, res) => {
 
         updateGenerationStage(requestContext.id, "requesting_byteplus");
         const providerStartedAt = Date.now();
-        logEvent("INFO", "UPSTREAM", requestContext.id, "BytePlus request started", {
+        logEvent("DEBUG", "UPSTREAM", requestContext.id, "BytePlus request started", {
           endpoint: summary.endpoint,
           model: MODEL_ID,
           size: providerBody.size,
@@ -108,7 +132,7 @@ const server = http.createServer(async (req, res) => {
         const upstream = await callBytePlus(endpoint, apiKey, providerBody, generationController.signal);
         const provider = upstream.payload;
         const generatedImages = Array.isArray(provider && provider.data) ? provider.data.length : 0;
-        logEvent("INFO", "UPSTREAM", requestContext.id, "BytePlus response received", {
+        logEvent("DEBUG", "UPSTREAM", requestContext.id, "BytePlus response received", {
           status: upstream.status,
           durationMs: Date.now() - providerStartedAt,
           providerRequestId: upstream.requestId,
@@ -118,7 +142,7 @@ const server = http.createServer(async (req, res) => {
 
         updateGenerationStage(requestContext.id, "saving_images");
         const saveStartedAt = Date.now();
-        logEvent("INFO", "SAVE", requestContext.id, "saving generated images", {
+        logEvent("DEBUG", "SAVE", requestContext.id, "saving generated images", {
           images: generatedImages,
           outputDir: OUTPUT_DIR
         });
@@ -127,7 +151,7 @@ const server = http.createServer(async (req, res) => {
           providerBody.output_format,
           generationController.signal
         );
-        logEvent("INFO", "SAVE", requestContext.id, "image saving finished", {
+        logEvent("DEBUG", "SAVE", requestContext.id, "image saving finished", {
           durationMs: Date.now() - saveStartedAt,
           saved: savedResult.files.length,
           failed: savedResult.errors.length,
@@ -182,14 +206,9 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, 405, { ok: false, error: "Method not allowed." });
   } catch (error) {
     const status = error.statusCode || error.status || 500;
-    logEvent(status >= 500 ? "ERROR" : "WARN", "HTTP", requestContext.id, "request failed", {
-      method: requestContext.method,
-      path: requestContext.path,
-      status,
-      error: error.message || "Unknown error"
-    });
+    requestContext.error = error.message || "Unknown error";
     if (!error.expose && error.stack) {
-      logEvent("ERROR", "SERVER", requestContext.id, "internal error stack", {
+      logEvent("DEBUG", "SERVER", requestContext.id, "internal error stack", {
         stack: truncateLogText(error.stack, 1200)
       });
     }
@@ -240,6 +259,12 @@ function normalizeStatusLogInterval(value) {
   return Number.isFinite(parsed) && parsed >= 1000 ? parsed : 10000;
 }
 
+function normalizeLogLevel(value) {
+  return Object.prototype.hasOwnProperty.call(LOG_LEVEL_ALIASES, value)
+    ? LOG_LEVEL_ALIASES[value]
+    : "info";
+}
+
 function beginHttpRequest(req, res) {
   const id = randomUUID().slice(0, 8);
   const startedAt = Date.now();
@@ -250,12 +275,18 @@ function beginHttpRequest(req, res) {
     : req.headers["content-length"];
   const contentLength = Number.parseInt(rawContentLength || "0", 10);
 
+  const requestContext = {
+    id,
+    startedAt,
+    method,
+    path: requestPath,
+    error: undefined
+  };
+
   RUNTIME_STATE.totalRequests += 1;
   RUNTIME_STATE.activeRequests += 1;
   res.setHeader("X-Request-Id", id);
-  logEvent("INFO", "HTTP", id, "request started", {
-    method,
-    path: requestPath,
+  logEvent("DEBUG", "HTTP", id, `${method} ${requestPath} started`, {
     contentLength: Number.isFinite(contentLength) && contentLength > 0 ? contentLength : undefined
   });
 
@@ -265,20 +296,22 @@ function beginHttpRequest(req, res) {
     settled = true;
     RUNTIME_STATE.activeRequests = Math.max(0, RUNTIME_STATE.activeRequests - 1);
     const status = res.statusCode || 0;
-    const level = status >= 500 ? "ERROR" : status >= 400 || reason !== "finished" ? "WARN" : "INFO";
-    logEvent(level, "HTTP", id, "request finished", {
-      method,
-      path: requestPath,
-      status,
+    const level = status >= 500
+      ? "ERROR"
+      : status >= 400 || reason !== "finished"
+        ? "WARN"
+        : "DEBUG";
+    logEvent(level, "HTTP", id, `${method} ${requestPath} -> ${status}`, {
       durationMs: Date.now() - startedAt,
-      reason
+      reason: reason === "finished" ? undefined : reason,
+      error: requestContext.error ? truncateLogText(requestContext.error, 500) : undefined
     });
   };
 
   res.once("finish", () => settle("finished"));
   res.once("close", () => settle(res.writableEnded ? "finished" : "connection_closed"));
 
-  return { id, startedAt, method, path: requestPath };
+  return requestContext;
 }
 
 function getRequestPath(rawUrl) {
@@ -290,16 +323,15 @@ function getRequestPath(rawUrl) {
 }
 
 function logEvent(level, scope, requestId, message, details) {
-  const timestamp = new Date().toISOString();
   const normalizedLevel = String(level || "INFO").toUpperCase();
-  const normalizedScope = String(scope || "SERVER").toUpperCase();
-  const id = requestId || "--------";
-  let suffix = "";
-  if (details && Object.values(details).some((value) => value !== undefined)) {
-    suffix = ` ${JSON.stringify(details)}`;
-  }
+  if (!shouldLog(normalizedLevel)) return;
 
-  const line = `${timestamp} ${normalizedLevel.padEnd(5)} [${normalizedScope}] [${id}] ${message}${suffix}`;
+  const timestamp = formatLogTimestamp(new Date());
+  const normalizedScope = String(scope || "SERVER").toUpperCase();
+  const id = requestId ? ` ${requestId}` : "";
+  const suffix = formatLogDetails(details);
+
+  const line = `${timestamp} ${normalizedLevel.padEnd(5)} ${normalizedScope.padEnd(8)}${id} ${message}${suffix}`;
   if (normalizedLevel === "ERROR") {
     console.error(line);
   } else if (normalizedLevel === "WARN") {
@@ -307,6 +339,112 @@ function logEvent(level, scope, requestId, message, details) {
   } else {
     console.log(line);
   }
+}
+
+function shouldLog(level) {
+  if (LOG_LEVEL === "silent") return false;
+  const eventLevel = String(level || "INFO").toLowerCase();
+  const eventPriority = LOG_LEVEL_PRIORITIES[eventLevel] ?? LOG_LEVEL_PRIORITIES.info;
+  return eventPriority <= LOG_LEVEL_PRIORITIES[LOG_LEVEL];
+}
+
+function formatLogTimestamp(date) {
+  return formatLocalDateTime(date);
+}
+
+function getLocalDateTimeParts(date) {
+  const pad = (value, length = 2) => String(value).padStart(length, "0");
+  return {
+    year: String(date.getFullYear()),
+    month: pad(date.getMonth() + 1),
+    day: pad(date.getDate()),
+    hour: pad(date.getHours()),
+    minute: pad(date.getMinutes()),
+    second: pad(date.getSeconds())
+  };
+}
+
+function formatLocalDateTime(date) {
+  const parts = getLocalDateTimeParts(date);
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
+function formatLocalFileTimestamp(date) {
+  const parts = getLocalDateTimeParts(date);
+  return `${parts.year}${parts.month}${parts.day}-${parts.hour}${parts.minute}${parts.second}`;
+}
+
+function formatLogDetails(details) {
+  if (!details || typeof details !== "object") return "";
+  const entries = Object.entries(details).filter(([, value]) => value !== undefined);
+  if (entries.length === 0) return "";
+  return ` | ${entries
+    .map(([key, value]) => `${formatLogKey(key)}=${formatLogValue(key, value)}`)
+    .join(" ")}`;
+}
+
+function formatLogKey(key) {
+  const aliases = {
+    contentLength: "body",
+    durationMs: "duration",
+    referenceImages: "refs",
+    generatedImages: "generated",
+    savedImages: "saved",
+    requestTimeoutMs: "timeout",
+    statusLogIntervalMs: "heartbeat"
+  };
+  return aliases[key] || key;
+}
+
+function formatLogValue(key, value) {
+  if (typeof value === "number" && key.endsWith("Ms")) {
+    return formatDuration(value);
+  }
+  if (typeof value === "number" && (key === "bytes" || key === "contentLength")) {
+    return formatBytes(value);
+  }
+  if (typeof value === "string") {
+    const normalized = truncateLogText(value, 600);
+    return /^[A-Za-z0-9._:/@+\\-]+$/.test(normalized) ? normalized : JSON.stringify(normalized);
+  }
+  if (value === null || typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+
+  try {
+    return truncateLogText(JSON.stringify(value), 600);
+  } catch {
+    return "[unserializable]";
+  }
+}
+
+function formatDuration(value) {
+  const milliseconds = Math.max(0, Number(value) || 0);
+  if (milliseconds < 1000) return `${Math.round(milliseconds)}ms`;
+  if (milliseconds < 60000) {
+    const digits = milliseconds >= 10000 ? 1 : 2;
+    return `${(milliseconds / 1000).toFixed(digits)}s`;
+  }
+  const minutes = Math.floor(milliseconds / 60000);
+  const seconds = ((milliseconds % 60000) / 1000).toFixed(1);
+  return seconds === "0.0" ? `${minutes}m` : `${minutes}m${seconds}s`;
+}
+
+function formatDurationChinese(value) {
+  const milliseconds = Math.max(0, Number(value) || 0);
+  if (milliseconds < 1000) return "不足 1 秒";
+  const roundedSeconds = Math.round(milliseconds / 1000);
+  if (roundedSeconds < 60) return `${roundedSeconds} 秒`;
+  const minutes = Math.floor(roundedSeconds / 60);
+  const seconds = roundedSeconds % 60;
+  return seconds === 0 ? `${minutes} 分钟` : `${minutes} 分 ${seconds} 秒`;
+}
+
+function formatBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
 function truncateLogText(value, maxLength = 180) {
@@ -371,7 +509,10 @@ function beginGeneration(requestId, summary) {
     startedAt: now,
     updatedAt: now
   });
-  logEvent("INFO", "GENERATE", requestId, "generation accepted", summary);
+  const mode = summary.mode === "image-to-image" ? "图生图" : "文生图";
+  const references = summary.referenceImages > 0 ? `，参考图 ${summary.referenceImages} 张` : "";
+  logEvent("INFO", "GENERATE", requestId, `开始生成图片：${mode}，尺寸 ${summary.size}${references}。`);
+  logEvent("DEBUG", "GENERATE", requestId, "generation request", summary);
 }
 
 function updateGenerationStage(requestId, stage) {
@@ -394,13 +535,33 @@ function finishGeneration(requestId, outcome, details = {}) {
     RUNTIME_STATE.failedGenerations += 1;
   }
 
+  const durationMs = Date.now() - generation.startedAt;
   const level = outcome === "succeeded" ? "INFO" : outcome === "cancelled" ? "WARN" : "ERROR";
-  logEvent(level, "GENERATE", requestId, `generation ${outcome}`, {
-    durationMs: Date.now() - generation.startedAt,
-    finalStage: generation.stage,
+  logEvent(level, "GENERATE", requestId, formatGenerationOutcomeMessage(outcome, details, durationMs));
+  logEvent("DEBUG", "GENERATE", requestId, "generation outcome", {
+    outcome,
+    durationMs,
+    finalStage: outcome === "succeeded" ? undefined : generation.stage,
     ...details,
     error: details.error ? truncateLogText(details.error, 500) : undefined
   });
+}
+
+function formatGenerationOutcomeMessage(outcome, details, durationMs) {
+  const duration = formatDurationChinese(durationMs);
+  if (outcome === "succeeded") {
+    const generated = Math.max(0, Number(details.generatedImages) || 0);
+    const saved = Math.max(0, Number(details.savedImages) || 0);
+    const saveErrors = Math.max(0, Number(details.saveErrors) || 0);
+    const saveErrorText = saveErrors > 0 ? `，${saveErrors} 张保存失败` : "";
+    return `图片生成完成：生成 ${generated} 张，已保存 ${saved} 张${saveErrorText}，耗时 ${duration}。`;
+  }
+  if (outcome === "cancelled") {
+    return `图片生成任务已取消，耗时 ${duration}。`;
+  }
+
+  const error = details.error ? truncateLogText(details.error, 500) : "未知错误";
+  return `图片生成失败，耗时 ${duration}。原因：${error}`;
 }
 
 function summarizeProviderUsage(provider) {
@@ -442,11 +603,11 @@ function getRuntimeSnapshot({ excludeCurrentRequest = false } = {}) {
 }
 
 function startStatusHeartbeat() {
-  if (STATUS_LOG_INTERVAL_MS <= 0) return;
+  if (STATUS_LOG_INTERVAL_MS <= 0 || !shouldLog("DEBUG")) return;
   const timer = setInterval(() => {
     if (RUNTIME_STATE.activeRequests === 0 && RUNTIME_STATE.activeGenerations.size === 0) return;
     const snapshot = getRuntimeSnapshot();
-    logEvent("INFO", "STATUS", null, "runtime heartbeat", {
+    logEvent("DEBUG", "STATUS", null, "runtime heartbeat", {
       uptimeSeconds: snapshot.uptimeSeconds,
       activeRequests: snapshot.requests.active,
       activeGenerations: snapshot.generations.active,
@@ -482,7 +643,7 @@ function listenWithFallback(port, attempts = 0) {
       port: nextPort,
       pid: process.pid,
       model: MODEL_ID,
-      startedAt: new Date().toISOString()
+      startedAt: formatLocalDateTime(new Date())
     };
 
     try {
@@ -491,11 +652,21 @@ function listenWithFallback(port, attempts = 0) {
       // Status file is a convenience only.
     }
 
-    logEvent("INFO", "SERVER", null, "Seedream frontend ready", {
-      url,
+    if (!Object.prototype.hasOwnProperty.call(LOG_LEVEL_ALIASES, LOG_LEVEL_INPUT)) {
+      logEvent("WARN", "SERVER", null, "LOG_LEVEL 配置无效，已回退到 info", {
+        configured: LOG_LEVEL_INPUT
+      });
+    }
+
+    const apiKeyStatus = getEnvApiKey() ? "已配置" : "未配置";
+    logEvent(
+      "INFO",
+      "SERVER",
+      null,
+      `Seedream 服务已启动，可访问 ${url}。当前模型：${MODEL_ID}；API Key：${apiKeyStatus}；日志级别：${LOG_LEVEL}。`
+    );
+    logEvent("DEBUG", "SERVER", null, "server configuration", {
       pid: process.pid,
-      model: MODEL_ID,
-      apiKey: getEnvApiKey() ? "configured" : "not_configured",
       outputDir: OUTPUT_DIR,
       requestTimeoutMs: REQUEST_TIMEOUT_MS,
       statusLogIntervalMs: STATUS_LOG_INTERVAL_MS
@@ -804,7 +975,7 @@ async function saveGeneratedImage(item, index, outputFormat, signal) {
     }
 
     const extension = normalizeImageExtension(outputFormat);
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const timestamp = formatLocalFileTimestamp(new Date());
     const fileName = `seedream-${timestamp}-${index + 1}-${randomUUID().slice(0, 8)}.${extension}`;
     const filePath = path.join(OUTPUT_DIR, fileName);
     await fs.promises.writeFile(filePath, content, { flag: "wx", signal });
