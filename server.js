@@ -1,5 +1,6 @@
 const http = require("node:http");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { randomUUID } = require("node:crypto");
 const { URL } = require("node:url");
@@ -32,6 +33,7 @@ const OUTPUT_DIR = path.resolve(__dirname, process.env.OUTPUT_DIR || "generated"
 const DEFAULT_MODEL_ID = "dola-seedream-5-0-pro-260628";
 const MODEL_ID = String(process.env.ARK_MODEL_ID || DEFAULT_MODEL_ID).trim() || DEFAULT_MODEL_ID;
 const DEFAULT_PORT = Number.parseInt(process.env.PORT || "8787", 10);
+const LISTEN_HOST = String(process.env.HOST || "127.0.0.1").trim() || "127.0.0.1";
 const MAX_BODY_BYTES = Number.parseInt(process.env.MAX_BODY_BYTES || String(90 * 1024 * 1024), 10);
 const MAX_SAVED_IMAGE_BYTES = Number.parseInt(
   process.env.MAX_SAVED_IMAGE_BYTES || String(50 * 1024 * 1024),
@@ -50,6 +52,13 @@ const RUNTIME_STATE = {
   failedGenerations: 0,
   cancelledGenerations: 0,
   activeGenerations: new Map()
+};
+
+const SERVER_STATE = {
+  host: LISTEN_HOST,
+  address: null,
+  port: null,
+  accessUrls: []
 };
 
 const REGION_BASE_URLS = {
@@ -94,6 +103,12 @@ const server = http.createServer(async (req, res) => {
         logging: {
           level: LOG_LEVEL,
           statusIntervalMs: STATUS_LOG_INTERVAL_MS
+        },
+        network: {
+          host: SERVER_STATE.host,
+          address: SERVER_STATE.address,
+          port: SERVER_STATE.port,
+          accessUrls: SERVER_STATE.accessUrls
         },
         runtime: getRuntimeSnapshot({ excludeCurrentRequest: true })
       });
@@ -617,6 +632,37 @@ function startStatusHeartbeat() {
   timer.unref();
 }
 
+function getAccessUrls(host, port) {
+  if (host !== "0.0.0.0") {
+    return [`http://${formatUrlHost(host)}:${port}`];
+  }
+
+  const hosts = new Set(["127.0.0.1"]);
+  try {
+    for (const entries of Object.values(os.networkInterfaces())) {
+      for (const entry of entries || []) {
+        const isIpv4 = entry.family === "IPv4" || entry.family === 4;
+        if (!isIpv4 || entry.internal || entry.address.startsWith("169.254.")) continue;
+        hosts.add(entry.address);
+      }
+    }
+  } catch {
+    // Loopback remains available even if interface discovery fails.
+  }
+
+  return [...hosts].map((address) => `http://${formatUrlHost(address)}:${port}`);
+}
+
+function formatUrlHost(host) {
+  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+}
+
+function summarizeAccessUrls(accessUrls) {
+  const visibleUrls = accessUrls.slice(0, 2);
+  const remainder = accessUrls.length > visibleUrls.length ? "（其他地址见 /api/health）" : "";
+  return `${visibleUrls.join("、")}${remainder}`;
+}
+
 function listenWithFallback(port, attempts = 0) {
   const nextPort = port + attempts;
 
@@ -636,10 +682,19 @@ function listenWithFallback(port, attempts = 0) {
     process.exitCode = 1;
   });
 
-  server.listen(nextPort, "127.0.0.1", () => {
-    const url = `http://127.0.0.1:${nextPort}`;
+  server.listen(nextPort, LISTEN_HOST, () => {
+    const address = server.address();
+    const boundAddress = address && typeof address === "object" ? address.address : LISTEN_HOST;
+    const accessUrls = getAccessUrls(LISTEN_HOST, nextPort);
+    const url = accessUrls[0];
+    SERVER_STATE.address = boundAddress;
+    SERVER_STATE.port = nextPort;
+    SERVER_STATE.accessUrls = accessUrls;
     const status = {
       url,
+      urls: accessUrls,
+      host: LISTEN_HOST,
+      address: boundAddress,
       port: nextPort,
       pid: process.pid,
       model: MODEL_ID,
@@ -663,10 +718,12 @@ function listenWithFallback(port, attempts = 0) {
       "INFO",
       "SERVER",
       null,
-      `Seedream 服务已启动，可访问 ${url}。当前模型：${MODEL_ID}；API Key：${apiKeyStatus}；日志级别：${LOG_LEVEL}。`
+      `Seedream 服务已启动，可访问 ${summarizeAccessUrls(accessUrls)}。当前模型：${MODEL_ID}；API Key：${apiKeyStatus}；日志级别：${LOG_LEVEL}。`
     );
     logEvent("DEBUG", "SERVER", null, "server configuration", {
       pid: process.pid,
+      listenHost: LISTEN_HOST,
+      boundAddress,
       outputDir: OUTPUT_DIR,
       requestTimeoutMs: REQUEST_TIMEOUT_MS,
       statusLogIntervalMs: STATUS_LOG_INTERVAL_MS
