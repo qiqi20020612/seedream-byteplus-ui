@@ -477,7 +477,7 @@ async function handleFileInput(event) {
 
     const value = await fileToDataUrl(file);
     const reference = {
-      id: crypto.randomUUID(),
+      id: createClientId(),
       type: "file",
       name: file.name,
       value
@@ -509,7 +509,7 @@ function addImageUrl() {
   }
 
   const reference = {
-    id: crypto.randomUUID(),
+    id: createClientId(),
     type: "url",
     name: shortName(value),
     value
@@ -728,7 +728,13 @@ async function handleSubmit(event) {
     return;
   }
 
-  const task = createGenerationTask(payload);
+  let task;
+  try {
+    task = createGenerationTask(payload);
+  } catch (error) {
+    showNotice(`无法开始生成：${error.message}`, "error");
+    return;
+  }
   state.lastPayload = payload;
   if (mobileDrawerMediaQuery.matches) {
     closeSettingsDrawer({ restoreFocus: false });
@@ -887,7 +893,7 @@ function extractError(data, status) {
 }
 
 function createGenerationTask(payload) {
-  const id = crypto.randomUUID();
+  const id = createClientId();
   const controller = new AbortController();
   const card = document.createElement("article");
   card.className = "result-card generation-card";
@@ -1023,6 +1029,27 @@ async function copyText(value) {
   } catch {
     showNotice("复制失败。", "error");
   }
+}
+
+function createClientId() {
+  const cryptoApi = globalThis.crypto;
+  if (cryptoApi && typeof cryptoApi.randomUUID === "function") {
+    return cryptoApi.randomUUID();
+  }
+
+  if (cryptoApi && typeof cryptoApi.getRandomValues === "function") {
+    try {
+      const values = new Uint32Array(2);
+      cryptoApi.getRandomValues(values);
+      return `local-${Date.now().toString(36)}-${[...values]
+        .map((value) => value.toString(36))
+        .join("")}`;
+    } catch {
+      // Fall through for browsers that restrict Web Crypto on plain HTTP.
+    }
+  }
+
+  return `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
 function shortName(value) {
