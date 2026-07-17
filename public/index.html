@@ -236,11 +236,6 @@
 
         <div class="notice is-hidden" id="notice"></div>
         <div class="result-grid is-empty" id="resultGrid"></div>
-
-        <details class="raw-panel">
-          <summary>原始响应</summary>
-          <pre id="rawResponse"></pre>
-        </details>
       </section>
     </main>
 
@@ -257,9 +252,22 @@
             <span data-icon="close" aria-hidden="true"></span>
           </button>
         </header>
-        <div class="image-preview-stage">
-          <img id="imagePreviewImage" alt="">
+        <div class="image-preview-stage" id="imagePreviewStage">
+          <button
+            type="button"
+            class="image-preview-zoom"
+            id="imagePreviewZoom"
+            aria-label="放大图片以查看细节"
+            aria-pressed="false"
+            title="点击放大图片"
+          >
+            <img id="imagePreviewImage" alt="" draggable="false">
+          </button>
         </div>
+        <details class="image-preview-response" id="imagePreviewResponse">
+          <summary>原始响应</summary>
+          <pre id="rawResponse"></pre>
+        </details>
       </div>
     </dialog>
 

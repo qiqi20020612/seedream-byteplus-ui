@@ -44,7 +44,8 @@ const state = {
   generations: new Map(),
   themePreference: "system",
   settingsOpen: false,
-  previewTrigger: null
+  previewTrigger: null,
+  previewLabel: ""
 };
 
 const els = {
@@ -59,8 +60,11 @@ const els = {
   closeSettings: document.querySelector("#closeSettings"),
   drawerBackdrop: document.querySelector("#drawerBackdrop"),
   imagePreviewDialog: document.querySelector("#imagePreviewDialog"),
+  imagePreviewStage: document.querySelector("#imagePreviewStage"),
+  imagePreviewZoom: document.querySelector("#imagePreviewZoom"),
   imagePreviewImage: document.querySelector("#imagePreviewImage"),
   imagePreviewMeta: document.querySelector("#imagePreviewMeta"),
+  imagePreviewResponse: document.querySelector("#imagePreviewResponse"),
   closeImagePreview: document.querySelector("#closeImagePreview"),
   modelName: document.querySelector("#modelName"),
   serverStatus: document.querySelector("#serverStatus"),
@@ -111,7 +115,6 @@ const icons = {
   trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M6 7l1 14h10l1-14"/><path d="M9 7V4h6v3"/></svg>',
   spark: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2 9 10l-7 3 7 3 4 8 4-8 7-3-7-3-4-8Z"/></svg>',
   copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M4 16V6a2 2 0 0 1 2-2h10"/></svg>',
-  expand: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/><path d="m3 8 6-6M21 8l-6-6M3 16l6 6M21 16l-6 6"/></svg>',
   download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>',
   close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>',
   system: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
@@ -161,6 +164,8 @@ function bindEvents() {
   els.closeSettings.addEventListener("click", () => closeSettingsDrawer());
   els.drawerBackdrop.addEventListener("click", () => closeSettingsDrawer());
   els.closeImagePreview.addEventListener("click", closeImagePreview);
+  els.imagePreviewZoom.addEventListener("click", toggleImagePreviewZoom);
+  els.imagePreviewZoom.addEventListener("keydown", handleImagePreviewZoomKeydown);
   els.imagePreviewDialog.addEventListener("cancel", (event) => {
     event.preventDefault();
     closeImagePreview();
@@ -368,9 +373,12 @@ function openImagePreview(source, alt, trigger) {
   if (!source || !source.src) return;
 
   state.previewTrigger = trigger instanceof HTMLElement ? trigger : null;
+  state.previewLabel = source.label || "Seedream 生成结果";
+  resetImagePreviewZoom();
   els.imagePreviewImage.src = source.src;
   els.imagePreviewImage.alt = alt || "Seedream 生成结果大图";
-  els.imagePreviewMeta.textContent = source.label || "Seedream 生成结果";
+  els.rawResponse.textContent = source.rawResponse || "";
+  els.imagePreviewResponse.hidden = !source.rawResponse;
   els.imagePreviewDialog.removeAttribute("aria-hidden");
   document.body.classList.add("image-preview-open");
 
@@ -383,6 +391,99 @@ function openImagePreview(source, alt, trigger) {
   }
 
   requestAnimationFrame(() => els.closeImagePreview.focus({ preventScroll: true }));
+}
+
+function toggleImagePreviewZoom(event) {
+  if (els.imagePreviewStage.classList.contains("is-zoomed")) {
+    resetImagePreviewZoom();
+    return;
+  }
+
+  const naturalWidth = els.imagePreviewImage.naturalWidth;
+  const naturalHeight = els.imagePreviewImage.naturalHeight;
+  if (!naturalWidth || !naturalHeight) return;
+
+  const stageStyle = getComputedStyle(els.imagePreviewStage);
+  const paddingLeft = Number.parseFloat(stageStyle.paddingLeft) || 0;
+  const paddingRight = Number.parseFloat(stageStyle.paddingRight) || 0;
+  const paddingTop = Number.parseFloat(stageStyle.paddingTop) || 0;
+  const paddingBottom = Number.parseFloat(stageStyle.paddingBottom) || 0;
+  const availableWidth = Math.max(
+    1,
+    els.imagePreviewStage.clientWidth - paddingLeft - paddingRight
+  );
+  const availableHeight = Math.max(
+    1,
+    els.imagePreviewStage.clientHeight - paddingTop - paddingBottom
+  );
+  const fittedScale = Math.min(
+    1,
+    availableWidth / naturalWidth,
+    availableHeight / naturalHeight
+  );
+  const zoomScale = fittedScale < 0.999 ? 1 : 2;
+  const zoomWidth = Math.max(1, Math.round(naturalWidth * zoomScale));
+  const zoomHeight = Math.max(1, Math.round(naturalHeight * zoomScale));
+  const fittedWidth = naturalWidth * fittedScale;
+  const fittedHeight = naturalHeight * fittedScale;
+  let focusX = 0.5;
+  let focusY = 0.5;
+
+  if (event instanceof MouseEvent && event.detail > 0) {
+    const stageRect = els.imagePreviewStage.getBoundingClientRect();
+    const imageLeft = stageRect.left + paddingLeft + (availableWidth - fittedWidth) / 2;
+    const imageTop = stageRect.top + paddingTop + (availableHeight - fittedHeight) / 2;
+    focusX = clamp((event.clientX - imageLeft) / fittedWidth, 0, 1);
+    focusY = clamp((event.clientY - imageTop) / fittedHeight, 0, 1);
+  }
+
+  els.imagePreviewStage.style.setProperty("--preview-zoom-width", `${zoomWidth}px`);
+  els.imagePreviewStage.style.setProperty("--preview-zoom-height", `${zoomHeight}px`);
+  els.imagePreviewStage.classList.add("is-zoomed");
+  updateImagePreviewZoomControl(true);
+
+  requestAnimationFrame(() => {
+    els.imagePreviewStage.scrollLeft = Math.max(
+      0,
+      paddingLeft + focusX * zoomWidth - els.imagePreviewStage.clientWidth / 2
+    );
+    els.imagePreviewStage.scrollTop = Math.max(
+      0,
+      paddingTop + focusY * zoomHeight - els.imagePreviewStage.clientHeight / 2
+    );
+  });
+}
+
+function handleImagePreviewZoomKeydown(event) {
+  if (event.key !== "Enter" && event.key !== " ") return;
+
+  event.preventDefault();
+  toggleImagePreviewZoom(event);
+}
+
+function resetImagePreviewZoom({ updateMeta = true } = {}) {
+  els.imagePreviewStage.classList.remove("is-zoomed");
+  els.imagePreviewStage.style.removeProperty("--preview-zoom-width");
+  els.imagePreviewStage.style.removeProperty("--preview-zoom-height");
+  els.imagePreviewStage.scrollLeft = 0;
+  els.imagePreviewStage.scrollTop = 0;
+  updateImagePreviewZoomControl(false, { updateMeta });
+}
+
+function updateImagePreviewZoomControl(zoomed, { updateMeta = true } = {}) {
+  const label = zoomed ? "缩小图片以适应窗口" : "放大图片以查看细节";
+  els.imagePreviewZoom.setAttribute("aria-pressed", String(zoomed));
+  els.imagePreviewZoom.setAttribute("aria-label", label);
+  els.imagePreviewZoom.title = zoomed ? "点击还原图片" : "点击放大图片";
+
+  if (updateMeta && state.previewLabel) {
+    const hint = zoomed ? "滚动查看细节，点击图片还原" : "点击图片放大";
+    els.imagePreviewMeta.textContent = `${state.previewLabel} · ${hint}`;
+  }
+}
+
+function clamp(value, minimum, maximum) {
+  return Math.min(maximum, Math.max(minimum, value));
 }
 
 function closeImagePreview() {
@@ -398,11 +499,16 @@ function closeImagePreview() {
 function resetImagePreview() {
   const trigger = state.previewTrigger;
   state.previewTrigger = null;
+  resetImagePreviewZoom({ updateMeta: false });
+  state.previewLabel = "";
   document.body.classList.remove("image-preview-open");
   els.imagePreviewDialog.setAttribute("aria-hidden", "true");
   els.imagePreviewImage.removeAttribute("src");
   els.imagePreviewImage.alt = "";
   els.imagePreviewMeta.textContent = "Seedream 生成结果";
+  els.imagePreviewResponse.open = false;
+  els.imagePreviewResponse.hidden = false;
+  els.rawResponse.textContent = "";
 
   if (trigger && trigger.isConnected) {
     trigger.focus({ preventScroll: true });
@@ -905,7 +1011,7 @@ function renderResult(result, task) {
   const saved = Array.isArray(result.saved) ? result.saved : [];
   const saveErrors = Array.isArray(result.saveErrors) ? result.saveErrors : [];
   const savedByIndex = new Map(saved.map((item) => [item.index, item]));
-  els.rawResponse.textContent = JSON.stringify(result, null, 2);
+  const rawResponse = JSON.stringify(result, null, 2);
 
   if (saveErrors.length > 0) {
     showNotice(`生成成功，但有 ${saveErrors.length} 张图片未能自动保存。保存目录：${result.outputDir}`, "error");
@@ -915,7 +1021,9 @@ function renderResult(result, task) {
 
   const fragment = document.createDocumentFragment();
   images.forEach((item, index) => {
-    fragment.append(createResultCard(item, savedByIndex.get(index), index, task.outputFormat));
+    fragment.append(
+      createResultCard(item, savedByIndex.get(index), index, task.outputFormat, rawResponse)
+    );
   });
 
   if (task.card.isConnected) {
@@ -927,8 +1035,11 @@ function renderResult(result, task) {
   removeGenerationTask(task.id);
 }
 
-function createResultCard(item, saved, index, outputFormat) {
-  const source = normalizeImageSource(item, saved, outputFormat);
+function createResultCard(item, saved, index, outputFormat, rawResponse) {
+  const source = {
+    ...normalizeImageSource(item, saved, outputFormat),
+    rawResponse
+  };
   const card = document.createElement("article");
   card.className = "result-card";
 
@@ -963,28 +1074,20 @@ function createResultCard(item, saved, index, outputFormat) {
   actions.className = "result-actions";
 
   if (source.src) {
-    const preview = document.createElement("button");
-    preview.type = "button";
-    preview.setAttribute("aria-haspopup", "dialog");
-    preview.innerHTML = `${icons.expand}预览`;
-    preview.addEventListener("click", () => openImagePreview(source, image.alt, preview));
-    actions.append(preview);
-  }
+    const download = document.createElement("a");
+    download.href = source.downloadValue || source.src;
+    download.download =
+      source.downloadName || `seedream-${Date.now()}-${index + 1}.${outputFormat}`;
+    download.innerHTML = `${icons.download}下载`;
+    actions.append(download);
 
-  if (source.copyValue) {
     const copy = document.createElement("button");
     copy.type = "button";
     copy.innerHTML = `${icons.copy}复制`;
-    copy.addEventListener("click", () => copyText(source.copyValue));
+    copy.addEventListener("click", () =>
+      copyImage(source.src, source.copyValue || source.src, copy)
+    );
     actions.append(copy);
-  }
-
-  if (source.downloadValue) {
-    const download = document.createElement("a");
-    download.href = source.downloadValue;
-    download.download = source.downloadName || `seedream-${Date.now()}-${index + 1}.${outputFormat}`;
-    download.innerHTML = `${icons.download}保存`;
-    actions.append(download);
   }
 
   body.append(actions);
@@ -997,6 +1100,8 @@ function normalizeImageSource(item, saved, outputFormat) {
     return {
       src: saved ? saved.url : item.url,
       label: saved ? `已保存 · ${saved.fileName}` : (item.size || "url"),
+      downloadValue: saved ? saved.url : item.url,
+      downloadName: saved ? saved.fileName : "",
       copyValue: item.url
     };
   }
@@ -1007,9 +1112,9 @@ function normalizeImageSource(item, saved, outputFormat) {
     return {
       src,
       label: saved ? `已保存 · ${saved.fileName}` : (item.size || "b64_json"),
-      copyValue: "",
       downloadValue: src,
-      downloadName: saved ? saved.fileName : ""
+      downloadName: saved ? saved.fileName : "",
+      copyValue: src
     };
   }
 
@@ -1152,16 +1257,173 @@ function clearResults() {
     els.resultGrid.append(card);
   }
   updateResultMeta();
-  els.rawResponse.textContent = "";
   hideNotice();
 }
 
-async function copyText(value) {
+async function copyImage(source, fallbackValue, trigger) {
+  trigger.disabled = true;
+  trigger.setAttribute("aria-busy", "true");
+
   try {
-    await navigator.clipboard.writeText(value);
-    showNotice("已复制。");
+    if (canCopyImage(source)) {
+      try {
+        const pngBlob = fetchClipboardImage(source);
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            "image/png": pngBlob
+          })
+        ]);
+        showNotice("图片已复制到剪贴板。");
+        return;
+      } catch {
+        // Fall back to the image link when binary clipboard access fails.
+      }
+    }
+
+    const link = resolveCopyLink(fallbackValue || source);
+    await copyTextToClipboard(link);
+    showNotice("当前环境无法复制图片，已复制链接。");
+  } catch (error) {
+    const detail = error && error.message ? `：${error.message}` : "";
+    showNotice(`复制失败${detail}`, "error");
+  } finally {
+    trigger.disabled = false;
+    trigger.removeAttribute("aria-busy");
+  }
+}
+
+function canCopyImage(source) {
+  if (
+    !window.isSecureContext ||
+    !navigator.clipboard ||
+    typeof navigator.clipboard.write !== "function" ||
+    typeof ClipboardItem !== "function"
+  ) {
+    return false;
+  }
+
+  try {
+    const sourceUrl = new URL(source, window.location.href);
+    return (
+      sourceUrl.origin === window.location.origin ||
+      sourceUrl.protocol === "data:" ||
+      sourceUrl.protocol === "blob:"
+    );
   } catch {
-    showNotice("复制失败。", "error");
+    return false;
+  }
+}
+
+function resolveCopyLink(value) {
+  const candidate = String(value || "").trim();
+  if (!candidate) {
+    throw new Error("没有可复制的图片链接");
+  }
+
+  try {
+    return new URL(candidate, window.location.href).href;
+  } catch {
+    return candidate;
+  }
+}
+
+async function copyTextToClipboard(value) {
+  if (
+    navigator.clipboard &&
+    typeof navigator.clipboard.writeText === "function"
+  ) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Fall through to the selection-based copy path.
+    }
+  }
+
+  const previousFocus = document.activeElement;
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.readOnly = true;
+  textarea.setAttribute("aria-hidden", "true");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  textarea.style.opacity = "0";
+  document.body.append(textarea);
+  textarea.focus({ preventScroll: true });
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } finally {
+    textarea.remove();
+    if (previousFocus instanceof HTMLElement && previousFocus.isConnected) {
+      previousFocus.focus({ preventScroll: true });
+    }
+  }
+
+  if (!copied) {
+    throw new Error("浏览器未允许访问剪贴板");
+  }
+}
+
+async function fetchClipboardImage(source) {
+  const response = await fetch(source);
+  if (!response.ok) {
+    throw new Error(`图片读取失败（${response.status}）`);
+  }
+
+  const blob = await response.blob();
+  if (!blob.size) {
+    throw new Error("图片数据为空");
+  }
+  if (blob.type === "image/png") {
+    return blob;
+  }
+
+  return convertImageBlobToPng(blob);
+}
+
+async function convertImageBlobToPng(blob) {
+  const objectUrl = URL.createObjectURL(blob);
+  const image = new Image();
+
+  try {
+    await new Promise((resolve, reject) => {
+      image.addEventListener("load", resolve, { once: true });
+      image.addEventListener(
+        "error",
+        () => reject(new Error("无法读取图片数据")),
+        { once: true }
+      );
+      image.src = objectUrl;
+    });
+
+    const canvas = document.createElement("canvas");
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const context = canvas.getContext("2d");
+    if (!context) {
+      throw new Error("无法转换图片格式");
+    }
+    context.drawImage(image, 0, 0);
+
+    return await new Promise((resolve, reject) => {
+      canvas.toBlob(
+        (pngBlob) => {
+          if (pngBlob) {
+            resolve(pngBlob);
+          } else {
+            reject(new Error("无法生成可复制的 PNG 图片"));
+          }
+        },
+        "image/png"
+      );
+    });
+  } finally {
+    URL.revokeObjectURL(objectUrl);
   }
 }
 

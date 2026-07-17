@@ -331,8 +331,7 @@ h2 {
 .field,
 .image-panel,
 .advanced-panel,
-.request-panel,
-.raw-panel {
+.request-panel {
   display: grid;
   gap: 8px;
 }
@@ -611,8 +610,7 @@ h2 {
 }
 
 .advanced-panel,
-.request-panel,
-.raw-panel {
+.request-panel {
   margin-top: 16px;
   border-top: 1px solid var(--line);
   padding-top: 14px;
@@ -959,7 +957,7 @@ pre {
 
 .image-preview-shell {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
   height: 100%;
 }
 
@@ -1010,16 +1008,80 @@ pre {
   min-height: 0;
   place-items: center;
   overflow: hidden;
+  overscroll-behavior: contain;
   padding: clamp(12px, 2.4vw, 32px);
   background: var(--surface-image);
 }
 
-.image-preview-stage img {
+.image-preview-zoom {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: zoom-in;
+}
+
+.image-preview-zoom:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: -4px;
+}
+
+.image-preview-zoom img {
   display: block;
-  max-width: 100%;
-  max-height: 100%;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  object-fit: scale-down;
+  pointer-events: none;
+  user-select: none;
+  filter: drop-shadow(0 18px 54px rgba(0, 0, 0, 0.24));
+}
+
+.image-preview-stage.is-zoomed {
+  display: block;
+  place-items: start;
+  overflow: auto;
+}
+
+.image-preview-stage.is-zoomed .image-preview-zoom {
+  width: max(100%, var(--preview-zoom-width));
+  height: max(100%, var(--preview-zoom-height));
+  cursor: zoom-out;
+  touch-action: pan-x pan-y;
+}
+
+.image-preview-stage.is-zoomed .image-preview-zoom img {
+  width: var(--preview-zoom-width);
+  height: var(--preview-zoom-height);
+  max-width: none;
+  max-height: none;
   object-fit: contain;
-  box-shadow: 0 18px 54px rgba(0, 0, 0, 0.24);
+}
+
+.image-preview-response {
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.image-preview-response > summary {
+  display: flex;
+  align-items: center;
+  min-height: 48px;
+  padding: 0 16px;
+}
+
+.image-preview-response > pre {
+  max-height: min(34dvh, 320px);
+  margin: 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
 }
 
 .result-card-body {
@@ -1072,6 +1134,11 @@ pre {
 .result-actions a:hover {
   border-color: var(--line-strong);
   background: var(--panel-soft);
+}
+
+.result-actions button:disabled {
+  cursor: wait;
+  opacity: 0.62;
 }
 
 .result-header-actions .mobile-settings-button {
@@ -1327,8 +1394,7 @@ pre {
   }
 
   .advanced-panel > summary,
-  .request-panel > summary,
-  .raw-panel > summary {
+  .request-panel > summary {
     display: flex;
     align-items: center;
     min-height: 44px;
