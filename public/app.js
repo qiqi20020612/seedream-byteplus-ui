@@ -34,6 +34,7 @@ const documentedSizePresets = {
   }
 };
 const supportedAspectRatios = Object.keys(documentedSizePresets["2K"]);
+let referenceDragDepth = 0;
 
 const state = {
   mode: "text",
@@ -68,6 +69,7 @@ const els = {
   clearPrompt: document.querySelector("#clearPrompt"),
   modeButtons: [...document.querySelectorAll(".mode-button")],
   imagePanel: document.querySelector("#imagePanel"),
+  referenceDropzone: document.querySelector("#referenceDropzone"),
   imageFiles: document.querySelector("#imageFiles"),
   imageUrl: document.querySelector("#imageUrl"),
   addImageUrl: document.querySelector("#addImageUrl"),
@@ -201,6 +203,12 @@ function bindEvents() {
 
   els.clearResults.addEventListener("click", clearResults);
   els.imageFiles.addEventListener("change", handleFileInput);
+  els.referenceDropzone.addEventListener("click", () => els.imageFiles.click());
+  els.referenceDropzone.addEventListener("dragenter", handleReferenceDragEnter);
+  els.referenceDropzone.addEventListener("dragover", handleReferenceDragOver);
+  els.referenceDropzone.addEventListener("dragleave", handleReferenceDragLeave);
+  els.referenceDropzone.addEventListener("drop", handleReferenceDrop);
+  document.addEventListener("paste", handleReferencePaste);
   els.addImageUrl.addEventListener("click", addImageUrl);
   els.imageUrl.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
@@ -458,39 +466,149 @@ function persistKey() {
 
 async function handleFileInput(event) {
   const files = [...event.target.files];
+  event.target.value = "";
+  await addReferenceFiles(files, { source: "picker" });
+}
+
+function handleReferenceDragEnter(event) {
+  if (!hasFileTransfer(event.dataTransfer)) return;
+
+  event.preventDefault();
+  referenceDragDepth += 1;
+  els.referenceDropzone.classList.add("is-dragging");
+}
+
+function handleReferenceDragOver(event) {
+  if (!hasFileTransfer(event.dataTransfer)) return;
+
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "copy";
+}
+
+function handleReferenceDragLeave() {
+  referenceDragDepth = Math.max(0, referenceDragDepth - 1);
+  if (referenceDragDepth === 0) {
+    els.referenceDropzone.classList.remove("is-dragging");
+  }
+}
+
+function handleReferenceDrop(event) {
+  if (!hasFileTransfer(event.dataTransfer)) return;
+
+  event.preventDefault();
+  referenceDragDepth = 0;
+  els.referenceDropzone.classList.remove("is-dragging");
+  void addReferenceFiles([...event.dataTransfer.files], { source: "drop" });
+}
+
+function handleReferencePaste(event) {
+  if (state.mode !== "image" || !event.clipboardData) return;
+
+  const imageFiles = getClipboardImageFiles(event.clipboardData);
+  if (imageFiles.length === 0) return;
+
+  const target = event.target;
+  const isEditingText = target instanceof HTMLElement
+    && (target.matches("input, textarea") || target.isContentEditable);
+  if (isEditingText && event.clipboardData.getData("text/plain").trim()) return;
+
+  event.preventDefault();
+  void addReferenceFiles(imageFiles, { source: "clipboard" });
+}
+
+function hasFileTransfer(dataTransfer) {
+  return Array.from(dataTransfer?.types || []).includes("Files");
+}
+
+function getClipboardImageFiles(clipboardData) {
+  const itemFiles = Array.from(clipboardData.items || [])
+    .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+    .map((item) => item.getAsFile())
+    .filter(Boolean);
+
+  if (itemFiles.length > 0) return itemFiles;
+
+  return Array.from(clipboardData.files || [])
+    .filter((file) => file.type.startsWith("image/"));
+}
+
+async function addReferenceFiles(fileList, { source = "picker" } = {}) {
+  const files = Array.from(fileList || []);
+  if (files.length === 0) {
+    if (source === "drop") {
+      showNotice("未找到可上传的图片文件。", "error");
+    }
+    return;
+  }
+
   let latestReference = null;
+  let addedCount = 0;
+  const problems = [];
+
   for (const file of files) {
     if (state.references.length >= MAX_REFERENCES) {
-      showNotice("参考图最多 10 张。", "error");
+      problems.push("参考图最多 10 张。");
       break;
     }
 
+    const name = getReferenceFileName(file, source, state.references.length + 1);
     if (file.size > MAX_REFERENCE_BYTES) {
-      showNotice(`${file.name} 超过 30 MB。`, "error");
+      problems.push(`${name} 超过 30 MB。`);
       continue;
     }
 
     if (!file.type.startsWith("image/")) {
-      showNotice(`${file.name} 不是图片文件。`, "error");
+      problems.push(`${name} 不是图片文件。`);
       continue;
     }
 
-    const value = await fileToDataUrl(file);
+    let value;
+    try {
+      value = await fileToDataUrl(file);
+    } catch {
+      problems.push(`${name} 读取失败。`);
+      continue;
+    }
+
     const reference = {
       id: createClientId(),
       type: "file",
-      name: file.name,
+      name,
       value
     };
     state.references.push(reference);
     latestReference = reference;
+    addedCount += 1;
   }
 
-  els.imageFiles.value = "";
   renderReferences();
   updateRequestPreview();
   if (latestReference) {
     void matchReferenceAspectRatio(latestReference);
+  }
+
+  showReferenceImportNotice(source, addedCount, problems);
+}
+
+function getReferenceFileName(file, source, position) {
+  if (source === "clipboard") return `剪贴板图片 ${position}`;
+  return String(file.name || "").trim() || `参考图 ${position}`;
+}
+
+function showReferenceImportNotice(source, addedCount, problems) {
+  if (problems.length > 0) {
+    const addedMessage = addedCount > 0 ? `已添加 ${addedCount} 张；` : "";
+    const extraMessage = problems.length > 1 ? `（另有 ${problems.length - 1} 个问题）` : "";
+    showNotice(`${addedMessage}${problems[0]}${extraMessage}`, "error");
+    return;
+  }
+
+  const sourceLabels = {
+    drop: "拖拽",
+    clipboard: "粘贴"
+  };
+  if (addedCount > 0 && sourceLabels[source]) {
+    showNotice(`已通过${sourceLabels[source]}添加 ${addedCount} 张参考图。`);
   }
 }
 
@@ -529,11 +647,27 @@ function renderReferences() {
     const item = document.createElement("div");
     item.className = "reference-item";
 
+    const preview = document.createElement("button");
+    preview.type = "button";
+    preview.className = "reference-preview";
+    preview.title = "点击预览";
+    preview.setAttribute("aria-label", `预览参考图：${reference.name}`);
+    preview.setAttribute("aria-haspopup", "dialog");
+
     const image = document.createElement("img");
     image.src = reference.value;
     image.alt = reference.name;
     image.loading = "lazy";
-    item.append(image);
+    image.decoding = "async";
+    preview.append(image);
+    preview.addEventListener("click", () => {
+      openImagePreview(
+        { src: reference.value, label: `参考图 · ${reference.name}` },
+        `参考图：${reference.name}`,
+        preview
+      );
+    });
+    item.append(preview);
 
     const name = document.createElement("span");
     name.className = "reference-name";

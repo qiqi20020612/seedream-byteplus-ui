@@ -86,14 +86,21 @@
 
           <fieldset class="image-panel is-hidden" id="imagePanel">
             <legend>参考图</legend>
-            <div class="file-row">
-              <label class="file-picker" for="imageFiles">
-                <span class="button-icon" data-icon="upload"></span>
-                本地图片
-              </label>
-              <input id="imageFiles" type="file" accept="image/jpeg,image/png,image/webp,image/bmp,image/tiff,image/gif,image/heic,image/heif" multiple>
-              <span class="counter" id="imageCount">0 / 10</span>
-            </div>
+            <button
+              type="button"
+              class="reference-dropzone"
+              id="referenceDropzone"
+              aria-label="选择、拖拽或粘贴参考图"
+              aria-describedby="referenceUploadHint"
+            >
+              <span class="dropzone-icon" data-icon="upload" aria-hidden="true"></span>
+              <span class="dropzone-copy">
+                <strong>选择或拖拽图片</strong>
+                <small id="referenceUploadHint">也可直接粘贴剪贴板图片</small>
+              </span>
+              <span class="counter" id="imageCount" aria-live="polite">0 / 10</span>
+            </button>
+            <input id="imageFiles" type="file" accept="image/jpeg,image/png,image/webp,image/bmp,image/tiff,image/gif,image/heic,image/heif" multiple tabindex="-1" aria-hidden="true">
 
             <div class="url-row">
               <input id="imageUrl" type="url" placeholder="https://example.com/image.png" autocomplete="off">

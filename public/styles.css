@@ -158,7 +158,6 @@ textarea:focus-visible {
 .brand,
 .topbar-actions,
 .result-header,
-.file-row,
 .url-row,
 .prompt-tools {
   display: flex;
@@ -308,8 +307,7 @@ h2 {
 .mode-button,
 .generate-button,
 .quiet-button,
-.icon-button,
-.file-picker {
+.icon-button {
   border: 0;
   border-radius: 8px;
 }
@@ -386,8 +384,7 @@ h2 {
   font-size: 13px;
 }
 
-.quiet-button,
-.file-picker {
+.quiet-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -400,7 +397,6 @@ h2 {
 }
 
 .quiet-button:hover,
-.file-picker:hover,
 .icon-button:hover {
   border-color: var(--line-strong);
   background: var(--panel-soft);
@@ -421,21 +417,73 @@ h2 {
 }
 
 #imageFiles {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
+  display: none;
 }
 
-.file-row {
-  justify-content: space-between;
-  gap: 10px;
+.reference-dropzone {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 72px;
+  padding: 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+  outline: none;
+  transition: border-color 160ms ease, background-color 160ms ease, box-shadow 160ms ease;
+}
+
+.reference-dropzone:hover,
+.reference-dropzone:focus-visible,
+.reference-dropzone.is-dragging {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+.reference-dropzone.is-dragging {
+  border-style: solid;
+}
+
+.dropzone-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 8px;
+  background: var(--teal-soft);
+  color: var(--teal);
+}
+
+.dropzone-icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.dropzone-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.dropzone-copy strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.dropzone-copy small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .counter {
   color: var(--muted);
   font-size: 13px;
+  white-space: nowrap;
 }
 
 .url-row {
@@ -468,9 +516,48 @@ h2 {
   background: var(--surface);
 }
 
-.reference-item img {
+.reference-preview {
+  position: relative;
+  display: block;
   width: 100%;
   height: 82px;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: var(--surface-image);
+  cursor: zoom-in;
+}
+
+.reference-preview::after {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: rgba(8, 14, 16, 0.74);
+  color: #ffffff;
+  content: "预览";
+  font-size: 11px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(3px);
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+.reference-preview:hover::after,
+.reference-preview:focus-visible::after {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.reference-preview:focus-visible {
+  outline-offset: -3px;
+}
+
+.reference-preview img {
+  width: 100%;
+  height: 100%;
   object-fit: cover;
   display: block;
   background: var(--surface-image);
@@ -1223,7 +1310,6 @@ pre {
   }
 
   .quiet-button,
-  .file-picker,
   .check-row {
     min-height: 44px;
   }
