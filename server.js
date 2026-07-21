@@ -30,6 +30,8 @@ const LOG_LEVEL = normalizeLogLevel(LOG_LEVEL_INPUT);
 const PUBLIC_DIR = path.join(__dirname, "public");
 const STATUS_FILE = path.join(__dirname, ".seedream-server.json");
 const OUTPUT_DIR = path.resolve(__dirname, process.env.OUTPUT_DIR || "generated");
+const AUTO_SAVE_IMAGES = readBooleanEnv("AUTO_SAVE_IMAGES", true);
+const SAVE_PROMPT_METADATA = readBooleanEnv("SAVE_PROMPT_METADATA", false);
 const DEFAULT_MODEL_ID = "dola-seedream-5-0-pro-260628";
 const MODEL_ID = String(process.env.ARK_MODEL_ID || DEFAULT_MODEL_ID).trim() || DEFAULT_MODEL_ID;
 const DEFAULT_PORT = Number.parseInt(process.env.PORT || "8787", 10);
@@ -41,6 +43,10 @@ const MAX_SAVED_IMAGE_BYTES = Number.parseInt(
 );
 const REQUEST_TIMEOUT_MS = Number.parseInt(process.env.REQUEST_TIMEOUT_MS || "180000", 10);
 const STATUS_LOG_INTERVAL_MS = normalizeStatusLogInterval(process.env.STATUS_LOG_INTERVAL_MS);
+
+if (SAVE_PROMPT_METADATA && !AUTO_SAVE_IMAGES) {
+  throw new Error("配置错误：SAVE_PROMPT_METADATA=true 需要同时设置 AUTO_SAVE_IMAGES=true。");
+}
 
 const RUNTIME_STATE = {
   startedAt: formatLocalDateTime(new Date()),
@@ -76,7 +82,8 @@ const MIME_TYPES = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
-  ".webp": "image/webp"
+  ".webp": "image/webp",
+  ".txt": "text/plain; charset=utf-8"
 };
 
 const server = http.createServer(async (req, res) => {
@@ -98,6 +105,11 @@ const server = http.createServer(async (req, res) => {
         model: MODEL_ID,
         hasEnvKey: Boolean(getEnvApiKey()),
         outputDir: OUTPUT_DIR,
+        storage: {
+          autoSaveImages: AUTO_SAVE_IMAGES,
+          savePromptMetadata: SAVE_PROMPT_METADATA,
+          outputDir: OUTPUT_DIR
+        },
         defaultBaseUrl: process.env.ARK_BASE_URL || REGION_BASE_URLS["ap-southeast-1"],
         regions: REGION_BASE_URLS,
         logging: {
@@ -155,29 +167,49 @@ const server = http.createServer(async (req, res) => {
           usage: summarizeProviderUsage(provider)
         });
 
-        updateGenerationStage(requestContext.id, "saving_images");
-        const saveStartedAt = Date.now();
-        logEvent("DEBUG", "SAVE", requestContext.id, "saving generated images", {
-          images: generatedImages,
-          outputDir: OUTPUT_DIR
-        });
-        const savedResult = await saveGeneratedImages(
-          provider,
-          providerBody.output_format,
-          generationController.signal
-        );
-        logEvent("DEBUG", "SAVE", requestContext.id, "image saving finished", {
-          durationMs: Date.now() - saveStartedAt,
-          saved: savedResult.files.length,
-          failed: savedResult.errors.length,
-          bytes: savedResult.files.reduce((total, file) => total + (file.bytes || 0), 0),
-          files: savedResult.files.map((file) => file.fileName)
-        });
+        let savedResult = { files: [], errors: [], metadataErrors: [] };
+        if (AUTO_SAVE_IMAGES) {
+          updateGenerationStage(requestContext.id, "saving_images");
+          const saveStartedAt = Date.now();
+          logEvent("DEBUG", "SAVE", requestContext.id, "saving generated images", {
+            images: generatedImages,
+            outputDir: OUTPUT_DIR,
+            savePromptMetadata: SAVE_PROMPT_METADATA
+          });
+          savedResult = await saveGeneratedImages(
+            provider,
+            providerBody.output_format,
+            createGenerationRecordContext({
+              requestId: requestContext.id,
+              providerRequestId: upstream.requestId,
+              input,
+              providerBody,
+              endpoint
+            }),
+            generationController.signal
+          );
+          logEvent("DEBUG", "SAVE", requestContext.id, "image saving finished", {
+            durationMs: Date.now() - saveStartedAt,
+            saved: savedResult.files.length,
+            failed: savedResult.errors.length,
+            metadataSaved: savedResult.files.filter((file) => file.metadataFileName).length,
+            metadataFailed: savedResult.metadataErrors.length,
+            bytes: savedResult.files.reduce((total, file) => total + (file.bytes || 0), 0),
+            files: savedResult.files.map((file) => file.fileName)
+          });
+        } else {
+          updateGenerationStage(requestContext.id, "finalizing");
+          logEvent("DEBUG", "SAVE", requestContext.id, "automatic image saving is disabled");
+        }
 
         finishGeneration(requestContext.id, "succeeded", {
           generatedImages,
           savedImages: savedResult.files.length,
-          saveErrors: savedResult.errors.length
+          saveErrors: savedResult.errors.length,
+          autoSaveImages: AUTO_SAVE_IMAGES,
+          savePromptMetadata: SAVE_PROMPT_METADATA,
+          metadataFiles: savedResult.files.filter((file) => file.metadataFileName).length,
+          metadataErrors: savedResult.metadataErrors.length
         });
         generationStarted = false;
         sendJson(res, 200, {
@@ -188,6 +220,9 @@ const server = http.createServer(async (req, res) => {
           request: safeRequest,
           saved: savedResult.files,
           saveErrors: savedResult.errors,
+          promptMetadataErrors: savedResult.metadataErrors,
+          autoSaveImages: AUTO_SAVE_IMAGES,
+          savePromptMetadata: SAVE_PROMPT_METADATA,
           outputDir: OUTPUT_DIR,
           provider
         });
@@ -266,6 +301,17 @@ function loadEnvFile() {
       process.env[key] = value;
     }
   }
+}
+
+function readBooleanEnv(name, fallback) {
+  const rawValue = process.env[name];
+  if (rawValue === undefined || String(rawValue).trim() === "") return fallback;
+
+  const value = String(rawValue).trim().toLowerCase();
+  if (["true", "1", "yes", "on"].includes(value)) return true;
+  if (["false", "0", "no", "off"].includes(value)) return false;
+
+  throw new Error(`${name} 仅支持 true/false、1/0、yes/no 或 on/off。`);
 }
 
 function normalizeStatusLogInterval(value) {
@@ -514,6 +560,116 @@ function summarizeGenerationRequest(input, providerBody, endpoint) {
   };
 }
 
+function createGenerationRecordContext({ requestId, providerRequestId, input, providerBody, endpoint }) {
+  const coreKeys = new Set([
+    "model",
+    "prompt",
+    "size",
+    "output_format",
+    "response_format",
+    "watermark",
+    "image"
+  ]);
+  const extraParameters = Object.fromEntries(
+    Object.entries(providerBody)
+      .filter(([key]) => !coreKeys.has(key))
+      .map(([key, value]) => [key, redactSensitiveRecordValue(value, key)])
+  );
+  const rawReferences = providerBody.image
+    ? (Array.isArray(providerBody.image) ? providerBody.image : [providerBody.image])
+    : [];
+
+  return {
+    generatedAt: formatLocalDateTime(new Date()),
+    requestId,
+    providerRequestId,
+    mode: input.mode === "image" ? "图生图" : "文生图",
+    endpoint: sanitizeLogUrl(endpoint),
+    prompt: String(providerBody.prompt || ""),
+    model: String(providerBody.model || MODEL_ID),
+    size: String(providerBody.size || ""),
+    outputFormat: String(providerBody.output_format || ""),
+    responseFormat: String(providerBody.response_format || ""),
+    watermark: Boolean(providerBody.watermark),
+    references: rawReferences.map(summarizeReferenceForRecord),
+    extraParameters
+  };
+}
+
+function summarizeReferenceForRecord(value) {
+  const reference = String(value || "");
+  if (reference.startsWith("data:")) {
+    const comma = reference.indexOf(",");
+    const header = comma > -1 ? reference.slice(0, comma) : "data:image";
+    return `${header},[图片数据已省略]`;
+  }
+  if (/^https?:\/\//i.test(reference)) {
+    return sanitizeLogUrl(reference);
+  }
+  return truncateLogText(reference, 500);
+}
+
+function redactSensitiveRecordValue(value, key = "") {
+  const sensitiveKey = /(^|[_-])(api[_-]?key|authorization|password|secret|access[_-]?token|refresh[_-]?token)($|[_-])/i;
+  if (sensitiveKey.test(String(key))) return "[已隐藏]";
+
+  if (typeof value === "string" && value.startsWith("data:")) {
+    const comma = value.indexOf(",");
+    const header = comma > -1 ? value.slice(0, comma) : "data";
+    return `${header},[数据已省略]`;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSensitiveRecordValue(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([nestedKey, nestedValue]) => [
+        nestedKey,
+        redactSensitiveRecordValue(nestedValue, nestedKey)
+      ])
+    );
+  }
+  return value;
+}
+
+function formatGenerationRecord(context, fileName, index) {
+  const lines = [
+    `生成时间：${context.generatedAt}`,
+    `请求 ID：${context.requestId}`
+  ];
+  if (context.providerRequestId) {
+    lines.push(`上游请求 ID：${context.providerRequestId}`);
+  }
+
+  lines.push(
+    `图片文件：${fileName}`,
+    `图片序号：${index + 1}`,
+    "",
+    "提示词：",
+    context.prompt,
+    "",
+    "生成参数：",
+    `模型：${context.model}`,
+    `尺寸：${context.size}`,
+    `生成模式：${context.mode}`,
+    `输出格式：${context.outputFormat}`,
+    `返回格式：${context.responseFormat}`,
+    `水印：${context.watermark ? "开启" : "关闭"}`,
+    `参考图数量：${context.references.length}`
+  );
+
+  if (context.references.length > 0) {
+    lines.push("参考图：", ...context.references.map((reference) => `- ${reference}`));
+  }
+
+  lines.push(`接口地址：${context.endpoint}`);
+  if (Object.keys(context.extraParameters).length > 0) {
+    lines.push("", "其他参数：", JSON.stringify(context.extraParameters, null, 2));
+  }
+
+  return `${lines.join(os.EOL)}${os.EOL}`;
+}
+
 function beginGeneration(requestId, summary) {
   const now = Date.now();
   RUNTIME_STATE.totalGenerations += 1;
@@ -566,10 +722,19 @@ function formatGenerationOutcomeMessage(outcome, details, durationMs) {
   const duration = formatDurationChinese(durationMs);
   if (outcome === "succeeded") {
     const generated = Math.max(0, Number(details.generatedImages) || 0);
+    if (details.autoSaveImages === false) {
+      return `图片生成完成：生成 ${generated} 张，自动保存已关闭，耗时 ${duration}。`;
+    }
+
     const saved = Math.max(0, Number(details.savedImages) || 0);
     const saveErrors = Math.max(0, Number(details.saveErrors) || 0);
+    const metadataFiles = Math.max(0, Number(details.metadataFiles) || 0);
+    const metadataErrors = Math.max(0, Number(details.metadataErrors) || 0);
     const saveErrorText = saveErrors > 0 ? `，${saveErrors} 张保存失败` : "";
-    return `图片生成完成：生成 ${generated} 张，已保存 ${saved} 张${saveErrorText}，耗时 ${duration}。`;
+    const metadataText = details.savePromptMetadata
+      ? `，已记录 ${metadataFiles} 份参数${metadataErrors > 0 ? `，${metadataErrors} 份记录失败` : ""}`
+      : "";
+    return `图片生成完成：生成 ${generated} 张，已保存 ${saved} 张${saveErrorText}${metadataText}，耗时 ${duration}。`;
   }
   if (outcome === "cancelled") {
     return `图片生成任务已取消，耗时 ${duration}。`;
@@ -718,13 +883,15 @@ function listenWithFallback(port, attempts = 0) {
       "INFO",
       "SERVER",
       null,
-      `Seedream 服务已启动，可访问 ${summarizeAccessUrls(accessUrls)}。当前模型：${MODEL_ID}；API Key：${apiKeyStatus}；日志级别：${LOG_LEVEL}。`
+      `Seedream 服务已启动，可访问 ${summarizeAccessUrls(accessUrls)}。当前模型：${MODEL_ID}；API Key：${apiKeyStatus}；日志级别：${LOG_LEVEL}；自动保存：${AUTO_SAVE_IMAGES ? "开启" : "关闭"}；参数记录：${SAVE_PROMPT_METADATA ? "开启" : "关闭"}。`
     );
     logEvent("DEBUG", "SERVER", null, "server configuration", {
       pid: process.pid,
       listenHost: LISTEN_HOST,
       boundAddress,
       outputDir: OUTPUT_DIR,
+      autoSaveImages: AUTO_SAVE_IMAGES,
+      savePromptMetadata: SAVE_PROMPT_METADATA,
       requestTimeoutMs: REQUEST_TIMEOUT_MS,
       statusLogIntervalMs: STATUS_LOG_INTERVAL_MS
     });
@@ -970,10 +1137,10 @@ function summarizeImagesForLog(image) {
   return Array.isArray(image) ? summarized : summarized[0];
 }
 
-async function saveGeneratedImages(provider, outputFormat, signal) {
+async function saveGeneratedImages(provider, outputFormat, recordContext, signal) {
   const images = Array.isArray(provider && provider.data) ? provider.data : [];
   if (images.length === 0) {
-    return { files: [], errors: [] };
+    return { files: [], errors: [], metadataErrors: [] };
   }
 
   throwIfGenerationCancelled(signal);
@@ -983,6 +1150,7 @@ async function saveGeneratedImages(provider, outputFormat, signal) {
   } catch (error) {
     return {
       files: [],
+      metadataErrors: [],
       errors: images.map((_, index) => ({
         index,
         error: error.message || "Unable to create the output directory."
@@ -990,7 +1158,7 @@ async function saveGeneratedImages(provider, outputFormat, signal) {
     };
   }
   const outcomes = await Promise.all(
-    images.map((item, index) => saveGeneratedImage(item, index, outputFormat, signal))
+    images.map((item, index) => saveGeneratedImage(item, index, outputFormat, recordContext, signal))
   );
   throwIfGenerationCancelled(signal);
 
@@ -999,15 +1167,23 @@ async function saveGeneratedImages(provider, outputFormat, signal) {
       if (outcome.error) {
         result.errors.push(outcome);
       } else {
-        result.files.push(outcome);
+        const { metadataError, ...savedFile } = outcome;
+        result.files.push(savedFile);
+        if (metadataError) {
+          result.metadataErrors.push({
+            index: savedFile.index,
+            fileName: savedFile.fileName,
+            error: metadataError
+          });
+        }
       }
       return result;
     },
-    { files: [], errors: [] }
+    { files: [], errors: [], metadataErrors: [] }
   );
 }
 
-async function saveGeneratedImage(item, index, outputFormat, signal) {
+async function saveGeneratedImage(item, index, outputFormat, recordContext, signal) {
   try {
     throwIfGenerationCancelled(signal);
     let content;
@@ -1037,13 +1213,28 @@ async function saveGeneratedImage(item, index, outputFormat, signal) {
     const filePath = path.join(OUTPUT_DIR, fileName);
     await fs.promises.writeFile(filePath, content, { flag: "wx", signal });
 
-    return {
+    const savedFile = {
       index,
       fileName,
       url: `/generated/${encodeURIComponent(fileName)}`,
       bytes: content.length,
       source
     };
+
+    if (SAVE_PROMPT_METADATA) {
+      const metadataFileName = `${path.basename(fileName, path.extname(fileName))}.txt`;
+      const metadataPath = path.join(OUTPUT_DIR, metadataFileName);
+      try {
+        const metadata = formatGenerationRecord(recordContext, fileName, index);
+        await fs.promises.writeFile(metadataPath, metadata, { flag: "wx", signal });
+        savedFile.metadataFileName = metadataFileName;
+        savedFile.metadataUrl = `/generated/${encodeURIComponent(metadataFileName)}`;
+      } catch (error) {
+        savedFile.metadataError = error.message || "Unable to save prompt metadata.";
+      }
+    }
+
+    return savedFile;
   } catch (error) {
     return {
       index,

@@ -1010,13 +1010,22 @@ function renderResult(result, task) {
   const images = Array.isArray(provider.data) ? provider.data : [];
   const saved = Array.isArray(result.saved) ? result.saved : [];
   const saveErrors = Array.isArray(result.saveErrors) ? result.saveErrors : [];
+  const promptMetadataErrors = Array.isArray(result.promptMetadataErrors)
+    ? result.promptMetadataErrors
+    : [];
   const savedByIndex = new Map(saved.map((item) => [item.index, item]));
   const rawResponse = JSON.stringify(result, null, 2);
 
-  if (saveErrors.length > 0) {
-    showNotice(`生成成功，但有 ${saveErrors.length} 张图片未能自动保存。保存目录：${result.outputDir}`, "error");
+  if (saveErrors.length > 0 || promptMetadataErrors.length > 0) {
+    const failures = [];
+    if (saveErrors.length > 0) failures.push(`${saveErrors.length} 张图片未能自动保存`);
+    if (promptMetadataErrors.length > 0) failures.push(`${promptMetadataErrors.length} 份提示词参数记录写入失败`);
+    showNotice(`生成成功，但${failures.join("，")}。保存目录：${result.outputDir}`, "error");
   } else if (saved.length > 0) {
-    showNotice(`已自动保存到 ${result.outputDir}`);
+    const savedContent = result.savePromptMetadata ? "图片及同名参数记录" : "图片";
+    showNotice(`已自动保存${savedContent}到 ${result.outputDir}`);
+  } else if (result.autoSaveImages === false) {
+    showNotice("生成完成，自动保存图片已关闭。", "info");
   }
 
   const fragment = document.createDocumentFragment();
